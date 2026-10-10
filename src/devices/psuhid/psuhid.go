@@ -272,6 +272,16 @@ func (d *Device) getProductData() {
 	hash := md5.Sum([]byte(seed))
 	serial := hex.EncodeToString(hash[:])
 	d.Serial = serial
+
+	// xerktech fork only: name PSUs "PSU<n>-<model>" so two identical ones are told apart in
+	// the UI and in metrics. PSU1 is the one on the plain product-id key (it keeps the legacy
+	// serial), PSU2 the one devices.go suffixed with its USB port. Done after the serial, which
+	// stays derived from the real product name.
+	n := 1
+	if strings.Contains(d.deviceKey, "-") {
+		n = 2
+	}
+	d.Product = fmt.Sprintf("PSU%d-%s", n, strings.TrimSuffix(product, " Power Supply"))
 }
 
 // UpdatePsuFan will update PSU fan speed

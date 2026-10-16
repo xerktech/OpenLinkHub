@@ -69,13 +69,19 @@ type DeviceProfile struct {
 }
 
 type Device struct {
-	dev           *hid.Device
-	deviceKey     string                    // devices.go registration key; "<productId>-<usb port>" for a duplicate
+	dev       *hid.Device
+	deviceKey string // devices.go registration key; "<productId>-<usb port>" for a duplicate
 	// Per device, not package globals: with two PSUs, globals made both refresh
 	// goroutines share one ticker (each refreshed at about half rate) and one mutex.
 	mutex           sync.Mutex
 	timer           *time.Ticker
 	autoRefreshChan chan bool
+	// Kept to find the PSU again after it drops off USB and re-enumerates: it comes back
+	// on a new hidraw node, but on the same USB port (usbPath, e.g. /devices/.../usb7/7-10).
+	vendorId      uint16
+	productId     uint16
+	usbPath       string
+	lost          bool                      // the HID handle failed (device unplugged); guarded by mutex
 	Manufacturer  string                    `json:"manufacturer"`
 	Product       string                    `json:"product"`
 	Serial        string                    `json:"serial"`
@@ -115,11 +121,11 @@ var (
 	deviceRefreshInterval = 1000
 	// A PSU that never answers a request would otherwise block transfer() (and Init)
 	// forever: hid Read has no timeout.
-	readTimeout           = 1000 * time.Millisecond
-	bufferSize            = 64
-	readBufferSize        = 64
-	bufferSizeWrite       = bufferSize + 1
-	temperatureChannels   = 2
+	readTimeout         = 1000 * time.Millisecond
+	bufferSize          = 64
+	readBufferSize      = 64
+	bufferSizeWrite     = bufferSize + 1
+	temperatureChannels = 2
 )
 
 func Init(vendorId, productId uint16, key, path string) *common.Device {
@@ -149,7 +155,10 @@ func Init(vendorId, productId uint16, key, path string) *common.Device {
 		},
 		IsPSU:     true,
 		deviceKey: key,
+		vendorId:  vendorId,
+		productId: productId,
 	}
+	d.usbPath, _ = common.GetShortUSBDevPath(filepath.Base(path))
 
 	// Bootstrap
 	d.getManufacturer()    // Manufacturer
@@ -462,6 +471,10 @@ func (d *Device) getDevices() int {
 
 // getDeviceData will fetch device data, from temperatures, fan speed, etc...
 func (d *Device) getDeviceData() {
+	if d.isLost() && !d.reopen() {
+		return
+	}
+
 	m := 0
 
 	// Main PSU
@@ -613,7 +626,64 @@ func (d *Device) getDeviceData() {
 		m++
 	}
 
+	// The handle died during this refresh: every reading above is a zeroed buffer, not
+	// data. Drop the series rather than publish 0 W, so absent()-style alerts can fire.
+	if d.isLost() {
+		metrics.RemovePsu(d.Serial)
+		return
+	}
 	d.updateDeviceMetrics()
+}
+
+// isLost reports whether the HID handle has failed and the device must be reopened
+func (d *Device) isLost() bool {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	return d.lost
+}
+
+// reopen looks for this PSU on its USB port and, once it is back, swaps in a fresh HID
+// handle. Without it, a PSU that re-enumerated (USB disconnect/reconnect) kept reading
+// from its dead hidraw node until the process restarted.
+func (d *Device) reopen() bool {
+	var paths []string
+	err := hid.Enumerate(d.vendorId, d.productId, func(info *hid.DeviceInfo) error {
+		usbPath, _ := common.GetShortUSBDevPath(filepath.Base(info.Path))
+		if d.usbPath == "" || usbPath == d.usbPath {
+			paths = append(paths, info.Path)
+		}
+		return nil
+	})
+	// No port recorded at init: only reopen when the match is unambiguous.
+	if err != nil || len(paths) != 1 {
+		return false
+	}
+
+	dev, err := hid.OpenPath(paths[0])
+	if err != nil {
+		return false
+	}
+
+	d.mutex.Lock()
+	if d.dev != nil {
+		_ = d.dev.Close()
+	}
+	d.dev = dev
+	d.lost = false
+	d.mutex.Unlock()
+
+	logger.Log(logger.Fields{"serial": d.Serial, "path": paths[0]}).Info("PSU reconnected, HID device reopened")
+	d.updateFanMode() // Restore a manual fan mode on the re-enumerated device
+	return true
+}
+
+// markLost flags the HID handle as dead after a write or read error. Caller holds mutex.
+func (d *Device) markLost(err error) {
+	if d.lost {
+		return
+	}
+	d.lost = true
+	logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Warn("PSU HID device lost, dropping its metrics until it reconnects")
 }
 
 // updateDeviceMetrics publishes every channel's latest readings to the metrics endpoint
@@ -797,8 +867,13 @@ func (d *Device) transfer(buffer []byte) ([]byte, error) {
 
 	bufferR := make([]byte, readBufferSize)
 
+	if d.lost {
+		return bufferR, errors.New("HID device lost")
+	}
+
 	if _, err := d.dev.Write(buffer); err != nil {
 		logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Error("Unable to write to a device")
+		d.markLost(err)
 		return bufferR, err
 	}
 
@@ -822,6 +897,10 @@ func (d *Device) transfer(buffer []byte) ([]byte, error) {
 				continue
 			}
 			logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Error("Unable to read data from device")
+			// A timeout is an unanswered request; any other read error is a dead handle.
+			if !errors.Is(err, hid.ErrTimeout) {
+				d.markLost(err)
+			}
 			return make([]byte, 64), err
 		}
 		if n == 0 {

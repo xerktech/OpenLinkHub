@@ -5,9 +5,9 @@ name: Go
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "xerktech-0.9.2" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "xerktech-0.9.2" ]
 
 permissions:
   contents: read
@@ -34,3 +34,18 @@ jobs:
         env:
           CGO_CFLAGS_ALLOW: -fno-strict-overflow
         run: go build -v ./...
+
+  instruction-size:
+    # Claude Code instruction files load into every session; keep each under 40,000 characters.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check instruction file size
+        run: |
+          status=0
+          for f in $(find . \( -name CLAUDE.md -o -name CLAUDE.local.md -o -path './.claude/rules/*.md' \) -not -path './.git/*'); do
+            n=$(wc -m < "$f")
+            echo "$f: $n chars"
+            if [ "$n" -ge 40000 ]; then echo "::error file=$f::$n chars, cap is 40000"; status=1; fi
+          done
+          exit $status

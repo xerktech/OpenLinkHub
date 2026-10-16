@@ -83,6 +83,7 @@ type Device struct {
 	usbPath       string
 	lost          bool                      // the HID handle failed (device unplugged); guarded by mutex
 	failed        bool                      // a transfer failed during the current refresh; guarded by mutex
+	refreshing    bool                      // getDeviceData is running; guarded by mutex
 	failedRuns    int                       // refreshes in a row with a failed transfer; refresh goroutine only
 	Manufacturer  string                    `json:"manufacturer"`
 	Product       string                    `json:"product"`
@@ -486,6 +487,7 @@ func (d *Device) getDeviceData() {
 	}
 	d.mutex.Lock()
 	d.failed = false
+	d.refreshing = true
 	d.mutex.Unlock()
 
 	// Snapshot the readings: a failed transfer decodes as 0, which must not reach the API either
@@ -649,7 +651,8 @@ func (d *Device) getDeviceData() {
 	// data. Drop the series rather than publish 0 W, so absent()-style alerts can fire.
 	d.mutex.Lock()
 	lost, failed := d.lost, d.failed
-	d.failed = false // let fan updates from the API through between refreshes
+	d.failed = false
+	d.refreshing = false
 	d.mutex.Unlock()
 	if failed {
 		// A timed-out request also leaves a zeroed reading; restore the previous values.
@@ -909,7 +912,8 @@ func (d *Device) transfer(buffer []byte) ([]byte, error) {
 	}
 	// The refresh is already discarded: fail the rest fast instead of waiting out a timeout
 	// per request (~40 s for a hung PSU, with its zeroed decodes visible in the API meanwhile).
-	if d.failed {
+	// Only inside a refresh: fan writes from the API, reopen and Stop must still reach the device.
+	if d.refreshing && d.failed {
 		return bufferR, errors.New("refresh already failed")
 	}
 

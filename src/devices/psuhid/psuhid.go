@@ -649,6 +649,7 @@ func (d *Device) getDeviceData() {
 	// data. Drop the series rather than publish 0 W, so absent()-style alerts can fire.
 	d.mutex.Lock()
 	lost, failed := d.lost, d.failed
+	d.failed = false // let fan updates from the API through between refreshes
 	d.mutex.Unlock()
 	if failed {
 		// A timed-out request also leaves a zeroed reading; restore the previous values.
@@ -905,6 +906,11 @@ func (d *Device) transfer(buffer []byte) ([]byte, error) {
 	if d.lost {
 		d.failed = true
 		return bufferR, errors.New("HID device lost")
+	}
+	// The refresh is already discarded: fail the rest fast instead of waiting out a timeout
+	// per request (~40 s for a hung PSU, with its zeroed decodes visible in the API meanwhile).
+	if d.failed {
+		return bufferR, errors.New("refresh already failed")
 	}
 
 	if _, err := d.dev.Write(buffer); err != nil {

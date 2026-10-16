@@ -13,6 +13,7 @@ paths:
   and is archived on restart, so `kubectl logs` shows nothing for device errors.
 - Never publish a zeroed buffer as a reading: a failed transfer returns 64 zero bytes, which decode
   to 0 W. Drop the series (`metrics.RemovePsu`) instead so absent()-style alerts fire.
-- `hid.ErrTimeout` is an unanswered request, not a dead handle: skip that refresh, keep the last values.
+- `hid.ErrTimeout` is an unanswered request, not a dead handle: skip that refresh, keep the last values;
+  after `maxFailedRefreshes` failed refreshes in a row drop the series so a hung PSU is not shown live.
   - Only other read/write errors mark the handle lost.
 - Serialise every `hid.Enumerate`/`hid.OpenPath` (`hidMutex`): hidapi's global error string races (double free).

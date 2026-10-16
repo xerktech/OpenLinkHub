@@ -83,6 +83,7 @@ type Device struct {
 	usbPath       string
 	lost          bool                      // the HID handle failed (device unplugged); guarded by mutex
 	failed        bool                      // a transfer failed during the current refresh; guarded by mutex
+	failedRuns    int                       // refreshes in a row with a failed transfer; refresh goroutine only
 	Manufacturer  string                    `json:"manufacturer"`
 	Product       string                    `json:"product"`
 	Serial        string                    `json:"serial"`
@@ -130,6 +131,9 @@ var (
 	readBufferSize      = 64
 	bufferSizeWrite     = bufferSize + 1
 	temperatureChannels = 2
+	// A PSU still on USB but not answering times out instead of erroring. Its last good
+	// readings are kept for a few refreshes, then dropped so they cannot look live forever.
+	maxFailedRefreshes = 3
 )
 
 func Init(vendorId, productId uint16, key, path string) *common.Device {
@@ -484,6 +488,12 @@ func (d *Device) getDeviceData() {
 	d.failed = false
 	d.mutex.Unlock()
 
+	// Snapshot the readings: a failed transfer decodes as 0, which must not reach the API either
+	previous := make(map[int]Devices, len(d.Devices))
+	for k, v := range d.Devices {
+		previous[k] = *v
+	}
+
 	m := 0
 
 	// Main PSU
@@ -640,14 +650,20 @@ func (d *Device) getDeviceData() {
 	d.mutex.Lock()
 	lost, failed := d.lost, d.failed
 	d.mutex.Unlock()
-	if lost {
-		metrics.RemovePsu(d.Serial)
-		return
-	}
-	// A timed-out request also leaves a zeroed reading; keep the previous values instead.
 	if failed {
+		// A timed-out request also leaves a zeroed reading; restore the previous values.
+		for k, v := range previous {
+			if dev, ok := d.Devices[k]; ok {
+				*dev = v
+			}
+		}
+		d.failedRuns++
+		if lost || d.failedRuns >= maxFailedRefreshes {
+			metrics.RemovePsu(d.Serial)
+		}
 		return
 	}
+	d.failedRuns = 0
 	d.updateDeviceMetrics()
 }
 

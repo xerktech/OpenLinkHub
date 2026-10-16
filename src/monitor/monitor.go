@@ -205,7 +205,7 @@ func Init() {
 							time.Sleep(2000 * time.Millisecond)
 						}
 						logger.Log(logger.Fields{"vendorId": vid, "productId": pid, "serial": serial}).Info("Init USB device...")
-						devices.InitManual(pid, serial)
+						devices.InitManual(pid, serial, devPath)
 						switchHeadsetAudioSink(pid)
 					}
 				}
@@ -224,6 +224,11 @@ func Init() {
 							serial := info.Serial
 							if len(serial) < 1 {
 								serial = strconv.Itoa(int(info.ProductID))
+							}
+
+							// Prefer the key the device registered under; it can differ from the USB serial
+							if registered, ok := devices.TakeSerialByDevPath(devPath); ok {
+								serial = registered
 							}
 							logger.Log(logger.Fields{"vendorId": info.VendorID, "productId": info.ProductID, "serial": serial}).Info("Dirty USB removal...")
 

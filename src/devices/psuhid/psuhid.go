@@ -69,13 +69,21 @@ type DeviceProfile struct {
 }
 
 type Device struct {
-	dev           *hid.Device
-	deviceKey     string                    // devices.go registration key; "<productId>-<usb port>" for a duplicate
+	dev       *hid.Device
+	deviceKey string // devices.go registration key; "<productId>-<usb port>" for a duplicate
 	// Per device, not package globals: with two PSUs, globals made both refresh
 	// goroutines share one ticker (each refreshed at about half rate) and one mutex.
 	mutex           sync.Mutex
 	timer           *time.Ticker
 	autoRefreshChan chan bool
+	// Kept to find the PSU again after it drops off USB and re-enumerates: it comes back
+	// on a new hidraw node, but on the same USB port (usbPath, e.g. /devices/.../usb7/7-10).
+	vendorId      uint16
+	productId     uint16
+	usbPath       string
+	lost          bool                      // the HID handle failed (device unplugged); guarded by mutex
+	refreshFailed bool                      // one of the current refresh's transfers failed; refresh goroutine only
+	failedRuns    int                       // refreshes in a row with a failed transfer; refresh goroutine only
 	Manufacturer  string                    `json:"manufacturer"`
 	Product       string                    `json:"product"`
 	Serial        string                    `json:"serial"`
@@ -93,7 +101,10 @@ type Device struct {
 }
 
 var (
-	pwd                   = ""
+	pwd = ""
+	// hidapi keeps its error string in a process global that hid_enumerate/hid_open_path
+	// free and reallocate; two PSUs reopening at once corrupted the heap (double free).
+	hidMutex              sync.Mutex
 	cmdInit               = byte(0xfe)
 	cmdRead               = byte(0x03)
 	cmdWrite              = byte(0x02)
@@ -115,11 +126,14 @@ var (
 	deviceRefreshInterval = 1000
 	// A PSU that never answers a request would otherwise block transfer() (and Init)
 	// forever: hid Read has no timeout.
-	readTimeout           = 1000 * time.Millisecond
-	bufferSize            = 64
-	readBufferSize        = 64
-	bufferSizeWrite       = bufferSize + 1
-	temperatureChannels   = 2
+	readTimeout         = 1000 * time.Millisecond
+	bufferSize          = 64
+	readBufferSize      = 64
+	bufferSizeWrite     = bufferSize + 1
+	temperatureChannels = 2
+	// A PSU still on USB but not answering times out instead of erroring. Its last good
+	// readings are kept for a few refreshes, then dropped so they cannot look live forever.
+	maxFailedRefreshes = 3
 )
 
 func Init(vendorId, productId uint16, key, path string) *common.Device {
@@ -127,7 +141,9 @@ func Init(vendorId, productId uint16, key, path string) *common.Device {
 	pwd = config.GetConfig().ConfigPath
 
 	// Open device, return if failure
+	hidMutex.Lock()
 	dev, err := hid.OpenPath(path)
+	hidMutex.Unlock()
 	if err != nil {
 		logger.Log(logger.Fields{"error": err, "vendorId": vendorId, "productId": productId, "path": path}).Error("Unable to open HID device")
 		return nil
@@ -149,7 +165,10 @@ func Init(vendorId, productId uint16, key, path string) *common.Device {
 		},
 		IsPSU:     true,
 		deviceKey: key,
+		vendorId:  vendorId,
+		productId: productId,
 	}
+	d.usbPath, _ = common.GetShortUSBDevPath(filepath.Base(path))
 
 	// Bootstrap
 	d.getManufacturer()    // Manufacturer
@@ -462,12 +481,23 @@ func (d *Device) getDevices() int {
 
 // getDeviceData will fetch device data, from temperatures, fan speed, etc...
 func (d *Device) getDeviceData() {
+	if d.isLost() && !d.reopen() {
+		return
+	}
+	d.refreshFailed = false
+
+	// Snapshot the readings: a failed transfer decodes as 0, which must not reach the API either
+	previous := make(map[int]Devices, len(d.Devices))
+	for k, v := range d.Devices {
+		previous[k] = *v
+	}
+
 	m := 0
 
 	// Main PSU
-	d.init()
+	d.refreshInit()
 	buf := d.createPacket(cmdRead, dataFanSpeed, 0)
-	output, err := d.transfer(buf)
+	output, err := d.refreshTransfer(buf)
 	if err != nil {
 		logger.Log(logger.Fields{"error": err}).Error("Unable to init to PSU device")
 	}
@@ -478,9 +508,9 @@ func (d *Device) getDeviceData() {
 
 	// Temps
 	for i := 0; i < temperatureChannels; i++ {
-		d.init()
+		d.refreshInit()
 		buf = d.createPacket(cmdRead, dataTempSensors[i], 0)
-		output, err = d.transfer(buf)
+		output, err = d.refreshTransfer(buf)
 		if err != nil {
 			logger.Log(logger.Fields{"error": err}).Error("Unable to init to PSU device")
 		}
@@ -500,16 +530,16 @@ func (d *Device) getDeviceData() {
 	}
 
 	// Power out
-	d.init()
+	d.refreshInit()
 	buf = d.createPacket(cmdWrite, cmdSwitch, data12V)
-	output, err = d.transfer(buf)
+	output, err = d.refreshTransfer(buf)
 	if err != nil {
 		logger.Log(logger.Fields{"error": err}).Error("Unable to init to PSU device")
 	}
 
-	d.init()
+	d.refreshInit()
 	buf = d.createPacket(cmdRead, dataPowerOut, 0)
-	output, err = d.transfer(buf)
+	output, err = d.refreshTransfer(buf)
 	if err != nil {
 		logger.Log(logger.Fields{"error": err}).Error("Unable to init to PSU device")
 	}
@@ -527,9 +557,9 @@ func (d *Device) getDeviceData() {
 
 	// Temps
 	for i := 0; i < temperatureChannels; i++ {
-		d.init()
+		d.refreshInit()
 		buf = d.createPacket(cmdRead, dataTempSensors[i], 0)
-		output, err = d.transfer(buf)
+		output, err = d.refreshTransfer(buf)
 		if err != nil {
 			logger.Log(logger.Fields{"error": err}).Error("Unable to init to PSU device")
 		}
@@ -544,16 +574,16 @@ func (d *Device) getDeviceData() {
 	}
 
 	// Power out
-	d.init()
+	d.refreshInit()
 	buf = d.createPacket(cmdWrite, cmdSwitch, data12V)
-	output, err = d.transfer(buf)
+	output, err = d.refreshTransfer(buf)
 	if err != nil {
 		logger.Log(logger.Fields{"error": err}).Error("Unable to init to PSU device")
 	}
 
-	d.init()
+	d.refreshInit()
 	buf = d.createPacket(cmdRead, dataPowerOut, 0)
-	output, err = d.transfer(buf)
+	output, err = d.refreshTransfer(buf)
 	if err != nil {
 		logger.Log(logger.Fields{"error": err}).Error("Unable to init to PSU device")
 	}
@@ -567,35 +597,35 @@ func (d *Device) getDeviceData() {
 	rails := []byte{data12V, data5V, data3V}
 	for _, rail := range rails {
 		// Switch rail
-		d.init()
+		d.refreshInit()
 		buf = d.createPacket(cmdWrite, cmdSwitch, rail)
-		output, err = d.transfer(buf)
+		output, err = d.refreshTransfer(buf)
 		if err != nil {
 			logger.Log(logger.Fields{"error": err}).Error("Unable to init to PSU device")
 		}
 
 		// Get amps
-		d.init()
+		d.refreshInit()
 		buf = d.createPacket(cmdRead, dataGetAmps, 0)
-		output, err = d.transfer(buf)
+		output, err = d.refreshTransfer(buf)
 		if err != nil {
 			logger.Log(logger.Fields{"error": err}).Error("Unable to init to PSU device")
 		}
 		railAmps := common.FromLinear11(output)
 
 		// Get volts
-		d.init()
+		d.refreshInit()
 		buf = d.createPacket(cmdRead, dataGetVolts, 0)
-		output, err = d.transfer(buf)
+		output, err = d.refreshTransfer(buf)
 		if err != nil {
 			logger.Log(logger.Fields{"error": err}).Error("Unable to init to PSU device")
 		}
 		railVolts := common.FromLinear11(output)
 
 		// Get watts
-		d.init()
+		d.refreshInit()
 		buf = d.createPacket(cmdRead, dataGetWatts, 0)
-		output, err = d.transfer(buf)
+		output, err = d.refreshTransfer(buf)
 		if err != nil {
 			logger.Log(logger.Fields{"error": err}).Error("Unable to init to PSU device")
 		}
@@ -613,7 +643,100 @@ func (d *Device) getDeviceData() {
 		m++
 	}
 
+	// The handle died during this refresh: every reading above is a zeroed buffer, not
+	// data. Drop the series rather than publish 0 W, so absent()-style alerts can fire.
+	if d.refreshFailed {
+		// A timed-out request also leaves a zeroed reading; restore the previous values.
+		for k, v := range previous {
+			if dev, ok := d.Devices[k]; ok {
+				*dev = v
+			}
+		}
+		d.failedRuns++
+		if d.isLost() || d.failedRuns >= maxFailedRefreshes {
+			metrics.RemovePsu(d.Serial)
+		}
+		return
+	}
+	d.failedRuns = 0
 	d.updateDeviceMetrics()
+}
+
+// refreshTransfer is transfer for getDeviceData. Once one of the refresh's own transfers
+// failed, its remaining ones fail fast instead of each waiting out a read timeout (~40 s
+// for a hung PSU, with zeroed decodes visible in the API meanwhile). Kept off the shared
+// transfer path so fan writes from the API, reopen and Stop are never short-circuited.
+func (d *Device) refreshTransfer(buf []byte) ([]byte, error) {
+	if d.refreshFailed {
+		return make([]byte, readBufferSize), errors.New("refresh already failed")
+	}
+	output, err := d.transfer(buf)
+	if err != nil {
+		d.refreshFailed = true
+	}
+	return output, err
+}
+
+// refreshInit is init for getDeviceData, through refreshTransfer
+func (d *Device) refreshInit() {
+	buf := d.createPacket(cmdInit, cmdRead, 0)
+	if _, err := d.refreshTransfer(buf); err != nil {
+		logger.Log(logger.Fields{"error": err}).Error("Unable to write data to a device")
+	}
+}
+
+// isLost reports whether the HID handle has failed and the device must be reopened
+func (d *Device) isLost() bool {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	return d.lost
+}
+
+// reopen looks for this PSU on its USB port and, once it is back, swaps in a fresh HID
+// handle. Without it, a PSU that re-enumerated (USB disconnect/reconnect) kept reading
+// from its dead hidraw node until the process restarted.
+func (d *Device) reopen() bool {
+	hidMutex.Lock()
+	defer hidMutex.Unlock()
+
+	var paths []string
+	err := hid.Enumerate(d.vendorId, d.productId, func(info *hid.DeviceInfo) error {
+		usbPath, _ := common.GetShortUSBDevPath(filepath.Base(info.Path))
+		if d.usbPath == "" || usbPath == d.usbPath {
+			paths = append(paths, info.Path)
+		}
+		return nil
+	})
+	// No port recorded at init: only reopen when the match is unambiguous.
+	if err != nil || len(paths) != 1 {
+		return false
+	}
+
+	dev, err := hid.OpenPath(paths[0])
+	if err != nil {
+		return false
+	}
+
+	d.mutex.Lock()
+	if d.dev != nil {
+		_ = d.dev.Close()
+	}
+	d.dev = dev
+	d.lost = false
+	d.mutex.Unlock()
+
+	logger.Log(logger.Fields{"serial": d.Serial, "path": paths[0]}).Info("PSU reconnected, HID device reopened")
+	d.updateFanMode() // Restore a manual fan mode on the re-enumerated device
+	return true
+}
+
+// markLost flags the HID handle as dead after a write or read error. Caller holds mutex.
+func (d *Device) markLost(err error) {
+	if d.lost {
+		return
+	}
+	d.lost = true
+	logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Warn("PSU HID device lost, dropping its metrics until it reconnects")
 }
 
 // updateDeviceMetrics publishes every channel's latest readings to the metrics endpoint
@@ -797,8 +920,13 @@ func (d *Device) transfer(buffer []byte) ([]byte, error) {
 
 	bufferR := make([]byte, readBufferSize)
 
+	if d.lost {
+		return bufferR, errors.New("HID device lost")
+	}
+
 	if _, err := d.dev.Write(buffer); err != nil {
 		logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Error("Unable to write to a device")
+		d.markLost(err)
 		return bufferR, err
 	}
 
@@ -822,6 +950,10 @@ func (d *Device) transfer(buffer []byte) ([]byte, error) {
 				continue
 			}
 			logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Error("Unable to read data from device")
+			// A timeout is an unanswered request; any other read error is a dead handle.
+			if !errors.Is(err, hid.ErrTimeout) {
+				d.markLost(err)
+			}
 			return make([]byte, 64), err
 		}
 		if n == 0 {

@@ -133,6 +133,17 @@ func PopulatePsu(channel *PsuChannel) {
 	mu.Unlock()
 }
 
+// RemovePsu drops every telemetry channel of one PSU, e.g. while it is disconnected
+func RemovePsu(serial string) {
+	mu.Lock()
+	for k, v := range psuMetrics {
+		if v.Serial == serial {
+			delete(psuMetrics, k)
+		}
+	}
+	mu.Unlock()
+}
+
 // GetPsuMetrics return PSU metrics
 func GetPsuMetrics() map[string]PsuChannel {
 	mu.RLock()

@@ -82,6 +82,7 @@ type Device struct {
 	productId     uint16
 	usbPath       string
 	lost          bool                      // the HID handle failed (device unplugged); guarded by mutex
+	failed        bool                      // a transfer failed during the current refresh; guarded by mutex
 	Manufacturer  string                    `json:"manufacturer"`
 	Product       string                    `json:"product"`
 	Serial        string                    `json:"serial"`
@@ -99,7 +100,10 @@ type Device struct {
 }
 
 var (
-	pwd                   = ""
+	pwd = ""
+	// hidapi keeps its error string in a process global that hid_enumerate/hid_open_path
+	// free and reallocate; two PSUs reopening at once corrupted the heap (double free).
+	hidMutex              sync.Mutex
 	cmdInit               = byte(0xfe)
 	cmdRead               = byte(0x03)
 	cmdWrite              = byte(0x02)
@@ -133,7 +137,9 @@ func Init(vendorId, productId uint16, key, path string) *common.Device {
 	pwd = config.GetConfig().ConfigPath
 
 	// Open device, return if failure
+	hidMutex.Lock()
 	dev, err := hid.OpenPath(path)
+	hidMutex.Unlock()
 	if err != nil {
 		logger.Log(logger.Fields{"error": err, "vendorId": vendorId, "productId": productId, "path": path}).Error("Unable to open HID device")
 		return nil
@@ -474,6 +480,9 @@ func (d *Device) getDeviceData() {
 	if d.isLost() && !d.reopen() {
 		return
 	}
+	d.mutex.Lock()
+	d.failed = false
+	d.mutex.Unlock()
 
 	m := 0
 
@@ -628,8 +637,15 @@ func (d *Device) getDeviceData() {
 
 	// The handle died during this refresh: every reading above is a zeroed buffer, not
 	// data. Drop the series rather than publish 0 W, so absent()-style alerts can fire.
-	if d.isLost() {
+	d.mutex.Lock()
+	lost, failed := d.lost, d.failed
+	d.mutex.Unlock()
+	if lost {
 		metrics.RemovePsu(d.Serial)
+		return
+	}
+	// A timed-out request also leaves a zeroed reading; keep the previous values instead.
+	if failed {
 		return
 	}
 	d.updateDeviceMetrics()
@@ -646,6 +662,9 @@ func (d *Device) isLost() bool {
 // handle. Without it, a PSU that re-enumerated (USB disconnect/reconnect) kept reading
 // from its dead hidraw node until the process restarted.
 func (d *Device) reopen() bool {
+	hidMutex.Lock()
+	defer hidMutex.Unlock()
+
 	var paths []string
 	err := hid.Enumerate(d.vendorId, d.productId, func(info *hid.DeviceInfo) error {
 		usbPath, _ := common.GetShortUSBDevPath(filepath.Base(info.Path))
@@ -868,12 +887,14 @@ func (d *Device) transfer(buffer []byte) ([]byte, error) {
 	bufferR := make([]byte, readBufferSize)
 
 	if d.lost {
+		d.failed = true
 		return bufferR, errors.New("HID device lost")
 	}
 
 	if _, err := d.dev.Write(buffer); err != nil {
 		logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Error("Unable to write to a device")
 		d.markLost(err)
+		d.failed = true
 		return bufferR, err
 	}
 
@@ -888,6 +909,7 @@ func (d *Device) transfer(buffer []byte) ([]byte, error) {
 		if remaining <= 0 {
 			err := errors.New("no matching response before the read timeout")
 			logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Error("Unable to read data from device")
+			d.failed = true
 			return make([]byte, 64), err
 		}
 
@@ -901,6 +923,7 @@ func (d *Device) transfer(buffer []byte) ([]byte, error) {
 			if !errors.Is(err, hid.ErrTimeout) {
 				d.markLost(err)
 			}
+			d.failed = true
 			return make([]byte, 64), err
 		}
 		if n == 0 {

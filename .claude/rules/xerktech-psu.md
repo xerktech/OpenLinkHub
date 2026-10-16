@@ -17,3 +17,5 @@ paths:
   after `maxFailedRefreshes` failed refreshes in a row drop the series so a hung PSU is not shown live.
   - Only other read/write errors mark the handle lost.
 - Serialise every `hid.Enumerate`/`hid.OpenPath` (`hidMutex`): hidapi's global error string races (double free).
+- Fail-fast after a failed transfer belongs only to the refresh (`refreshTransfer`), never `transfer`:
+  a shared flag there silently dropped API fan writes, the reopen fan restore and Stop's fan reset.

@@ -175,6 +175,7 @@ var (
 	interfaceId         = 0
 	devices             = make(map[string]*common.Device)
 	deviceList          = make(map[string]Device)
+	usbDevPaths         = make(map[string]string) // USB sysfs device path -> registered device serial
 	legacyDevices       = []uint16{3080, 3081, 3082, 3090, 3091, 3093, 7168}
 	initWG              sync.WaitGroup
 	Dispatch            dispatcher.DeviceDispatcher = CallDeviceMethod
@@ -459,8 +460,36 @@ func GetDevicesEx() map[string]*common.Device {
 	return out
 }
 
-// InitManual will initialize device manually when plugged in
-func InitManual(productId uint16, key string) {
+// trackUSBDevPath will remember which registered device sits behind a USB device path.
+// Some devices (e.g. PSUs) register under a key that is not their USB serial, so the hotplug
+// monitor cannot find them on removal without this.
+func trackUSBDevPath(path string, dev *common.Device) {
+	if dev == nil {
+		return
+	}
+	devPath, err := common.GetShortUSBDevPath(filepath.Base(path))
+	if err != nil {
+		return
+	}
+	mutex.Lock()
+	usbDevPaths[devPath] = dev.Serial
+	mutex.Unlock()
+}
+
+// TakeSerialByDevPath will return and forget the device serial registered for a USB device path
+func TakeSerialByDevPath(devPath string) (string, bool) {
+	mutex.Lock()
+	defer mutex.Unlock()
+	serial, ok := usbDevPaths[devPath]
+	if ok {
+		delete(usbDevPaths, devPath)
+	}
+	return serial, ok
+}
+
+// InitManual will initialize device manually when plugged in. devPath is the USB sysfs device
+// path of the plugged device; it picks the right interface when the device has no serial.
+func InitManual(productId uint16, key, devPath string) {
 	var device = Device{
 		ProductId: 0,
 		Path:      "",
@@ -491,6 +520,13 @@ func InitManual(productId uint16, key string) {
 		if info.InterfaceNbr == interfaceId {
 			if len(key) > 0 && info.SerialNbr != key {
 				return nil
+			}
+
+			// Without a serial, identical devices (e.g. two PSUs) are told apart by their USB port
+			if len(key) == 0 && len(devPath) > 0 {
+				if p, _ := common.GetShortUSBDevPath(filepath.Base(info.Path)); p != devPath {
+					return nil
+				}
 			}
 
 			devPath := info.Path
@@ -898,6 +934,7 @@ func initializeDevice(productId uint16, key, productPath string) {
 				defer initWG.Done()
 				dev := cb(vid, pid, serial, path)
 				addDevice(dev)
+				trackUSBDevPath(path, dev)
 			}(vendorId, productId, key, productPath, callback.DeviceRegister)
 		}
 
@@ -907,6 +944,7 @@ func initializeDevice(productId uint16, key, productPath string) {
 				defer initWG.Done()
 				dev := cb(vid, pid, serial, path, addDevice)
 				addDevice(dev)
+				trackUSBDevPath(path, dev)
 			}(vendorId, productId, key, productPath, callback.DeviceRegisterEx)
 		}
 	}

@@ -67,21 +67,25 @@ type DeviceProfile struct {
 }
 
 type Device struct {
-	dev           *hid.Device
-	Manufacturer  string                    `json:"manufacturer"`
-	Product       string                    `json:"product"`
-	Serial        string                    `json:"serial"`
-	Firmware      string                    `json:"firmware"`
-	Devices       map[int]*Devices          `json:"devices"`
-	UserProfiles  map[string]*DeviceProfile `json:"userProfiles"`
-	DeviceProfile *DeviceProfile
-	Template      string
-	CpuTemp       float32
-	GpuTemp       float32
-	FanModes      map[int]string
-	InputVoltage  float32
-	instance      *common.Device
-	IsPSU         bool
+	dev *hid.Device
+	// Per device, not package globals: with two PSUs, a stop sent on a shared channel
+	// could reach the wrong refresh loop or block forever once the listener had gone.
+	timer           *time.Ticker
+	autoRefreshChan chan bool
+	Manufacturer    string                    `json:"manufacturer"`
+	Product         string                    `json:"product"`
+	Serial          string                    `json:"serial"`
+	Firmware        string                    `json:"firmware"`
+	Devices         map[int]*Devices          `json:"devices"`
+	UserProfiles    map[string]*DeviceProfile `json:"userProfiles"`
+	DeviceProfile   *DeviceProfile
+	Template        string
+	CpuTemp         float32
+	GpuTemp         float32
+	FanModes        map[int]string
+	InputVoltage    float32
+	instance        *common.Device
+	IsPSU           bool
 }
 
 var (
@@ -105,8 +109,6 @@ var (
 	dataPowerOut          = byte(0xee)
 	dataInputVoltage      = byte(0x88)
 	mutex                 sync.Mutex
-	timer                 = &time.Ticker{}
-	autoRefreshChan       = make(chan bool)
 	deviceRefreshInterval = 1000
 	bufferSize            = 64
 	readBufferSize        = 64
@@ -173,8 +175,7 @@ func (d *Device) createDevice() {
 // Stop will stop all device operations and switch a device back to hardware mode
 func (d *Device) Stop() {
 	logger.Log(logger.Fields{"serial": d.Serial}).Info("Stopping device...")
-	timer.Stop()
-	autoRefreshChan <- true
+	d.stopAutoRefresh()
 	d.setFanToDefault()
 	if d.dev != nil {
 		err := d.dev.Close()
@@ -187,8 +188,7 @@ func (d *Device) Stop() {
 // StopDirty will stop device in a dirty way
 func (d *Device) StopDirty() uint8 {
 	logger.Log(logger.Fields{"serial": d.Serial}).Info("Stopping device (dirty)...")
-	timer.Stop()
-	autoRefreshChan <- true
+	d.stopAutoRefresh()
 	return 1
 }
 
@@ -716,19 +716,29 @@ func (d *Device) init() {
 
 // setAutoRefresh will refresh device data
 func (d *Device) setAutoRefresh() {
-	timer = time.NewTicker(time.Duration(deviceRefreshInterval) * time.Millisecond)
-	autoRefreshChan = make(chan bool)
-	go func() {
+	d.timer = time.NewTicker(time.Duration(deviceRefreshInterval) * time.Millisecond)
+	d.autoRefreshChan = make(chan bool)
+	go func(timer *time.Ticker, stop chan bool) {
 		for {
 			select {
 			case <-timer.C:
 				d.getDeviceData()
-			case <-autoRefreshChan:
+			case <-stop:
 				timer.Stop()
 				return
 			}
 		}
-	}()
+	}(d.timer, d.autoRefreshChan)
+}
+
+// stopAutoRefresh stops this device's refresh loop, if it was started
+func (d *Device) stopAutoRefresh() {
+	if d.timer == nil {
+		return
+	}
+	d.timer.Stop()
+	d.autoRefreshChan <- true
+	d.timer = nil
 }
 
 // transfer will send data to a device and retrieve device output

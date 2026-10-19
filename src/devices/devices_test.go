@@ -1,6 +1,9 @@
 package devices
 
-import "testing"
+import (
+	"OpenLinkHub/src/common"
+	"testing"
+)
 
 func TestTakeSerialByDevPath(t *testing.T) {
 	devPath := "/devices/pci0000:00/0000:00:14.0/usb1/1-2"
@@ -57,5 +60,40 @@ func TestSerialLessKeyKeepsIdenticalDevicesApart(t *testing.T) {
 	// Another product is not affected
 	if k := serialLessKey(7203, portA, "", keyRegistered); k != "7203" {
 		t.Fatalf("other product key = %q, want \"7203\"", k)
+	}
+}
+
+// The key is reserved before a device initializes, so an identical PSU plugged in while the first
+// one is still initializing does not take its key. The serial is filled in once it registers.
+func TestReserveUSBDevPath(t *testing.T) {
+	const portA = "/devices/pci0000:00/0000:00:14.0/usb1/1-2"
+	const portB = "/devices/pci0000:00/0000:00:14.0/usb1/1-3"
+	t.Cleanup(func() { delete(usbDevPaths, portA); delete(usbDevPaths, portB) })
+
+	reserveUSBDevPath(portA, "7199")
+	if k := serialLessKey(7199, portB, "", keyRegistered); k != "7199-1-3" {
+		t.Fatalf("key while A initializes = %q, want \"7199-1-3\"", k)
+	}
+	// Unplugged while initializing: nothing to stop yet, and the late registration is not kept
+	if _, ok := TakeSerialByDevPath(portA); ok {
+		t.Fatal("device still initializing should report no serial")
+	}
+	trackUSBDevPath(portA, &common.Device{Serial: "serialA"})
+	if _, ok := usbDevPaths[portA]; ok {
+		t.Fatal("device unplugged while initializing should be forgotten")
+	}
+
+	// Failed to initialize: the key is released
+	reserveUSBDevPath(portA, "7199")
+	trackUSBDevPath(portA, nil)
+	if keyRegistered("7199") {
+		t.Fatal("key of a device that failed to initialize should be released")
+	}
+
+	// Registered: the serial is kept under the reserved key
+	reserveUSBDevPath(portB, "7199-1-3")
+	trackUSBDevPath(portB, &common.Device{Serial: "serialB"})
+	if serial, ok := TakeSerialByDevPath(portB); !ok || serial != "serialB" {
+		t.Fatalf("got (%q, %v), want (\"serialB\", true)", serial, ok)
 	}
 }

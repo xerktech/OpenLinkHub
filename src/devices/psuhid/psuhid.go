@@ -91,6 +91,7 @@ type Device struct {
 
 var (
 	pwd                   = ""
+	pwdOnce               sync.Once
 	cmdInit               = byte(0xfe)
 	cmdRead               = byte(0x03)
 	cmdWrite              = byte(0x02)
@@ -119,7 +120,7 @@ var (
 
 func Init(vendorId, productId uint16, key, path string) *common.Device {
 	// Set global working directory
-	pwd = config.GetConfig().ConfigPath
+	pwdOnce.Do(func() { pwd = config.GetConfig().ConfigPath }) // PSUs initialize concurrently
 
 	// Open device, return if failure
 	dev, err := hid.OpenPath(path)

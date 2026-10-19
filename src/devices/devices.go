@@ -466,20 +466,35 @@ type usbDevice struct {
 	key    string // Key the device was initialized with
 }
 
-// trackUSBDevPath will remember which registered device sits behind a USB device path.
-// Some devices (e.g. PSUs) register under a key that is not their USB serial, so the hotplug
-// monitor cannot find them on removal without this.
-func trackUSBDevPath(path, key string, dev *common.Device) {
-	if dev == nil {
-		return
-	}
-	devPath, err := common.GetShortUSBDevPath(filepath.Base(path))
-	if err != nil {
+// reserveUSBDevPath will remember the key a device behind a USB device path is initialized with.
+// It is recorded before the device initializes, so an identical device plugged in meanwhile
+// does not take the same key.
+func reserveUSBDevPath(devPath, key string) {
+	if len(devPath) == 0 {
 		return
 	}
 	mutex.Lock()
-	usbDevPaths[devPath] = usbDevice{serial: dev.Serial, key: key}
+	usbDevPaths[devPath] = usbDevice{key: key}
 	mutex.Unlock()
+}
+
+// trackUSBDevPath will remember which registered device sits behind a USB device path.
+// Some devices (e.g. PSUs) register under a key that is not their USB serial, so the hotplug
+// monitor cannot find them on removal without this. A device that failed to initialize, or was
+// unplugged while initializing, is forgotten.
+func trackUSBDevPath(devPath string, dev *common.Device) {
+	mutex.Lock()
+	defer mutex.Unlock()
+	reserved, ok := usbDevPaths[devPath]
+	if !ok {
+		return
+	}
+	if dev == nil {
+		delete(usbDevPaths, devPath)
+		return
+	}
+	reserved.serial = dev.Serial
+	usbDevPaths[devPath] = reserved
 }
 
 // TakeSerialByDevPath will return and forget the device serial registered for a USB device path
@@ -490,7 +505,7 @@ func TakeSerialByDevPath(devPath string) (string, bool) {
 	if ok {
 		delete(usbDevPaths, devPath)
 	}
-	return dev.serial, ok
+	return dev.serial, ok && len(dev.serial) > 0
 }
 
 // keyRegistered will return true if a plugged device was initialized with given key
@@ -567,9 +582,9 @@ func InitManual(productId uint16, key, devPath string) {
 				}
 			}
 
-			devPath := info.Path
+			hidPath := info.Path
 			if config.GetConfig().CheckDevicePermission {
-				dev, err := os.Stat(devPath)
+				dev, err := os.Stat(hidPath)
 				if err != nil {
 					logger.Log(logger.Fields{"error": err}).Error("Unable to get device stat info")
 					return nil
@@ -969,13 +984,18 @@ var deviceRegisterMap = map[uint16]Product{
 func initializeDevice(productId uint16, key, productPath string) {
 	callback, ok := deviceRegisterMap[productId]
 	if ok {
+		devPath, err := common.GetShortUSBDevPath(filepath.Base(productPath))
+		if err == nil {
+			reserveUSBDevPath(devPath, key)
+		}
+
 		if callback.DeviceRegister != nil {
 			initWG.Add(1)
 			go func(vid, pid uint16, serial, path string, cb deviceRegister) {
 				defer initWG.Done()
 				dev := cb(vid, pid, serial, path)
 				addDevice(dev)
-				trackUSBDevPath(path, serial, dev)
+				trackUSBDevPath(devPath, dev)
 			}(vendorId, productId, key, productPath, callback.DeviceRegister)
 		}
 
@@ -985,7 +1005,7 @@ func initializeDevice(productId uint16, key, productPath string) {
 				defer initWG.Done()
 				dev := cb(vid, pid, serial, path, addDevice)
 				addDevice(dev)
-				trackUSBDevPath(path, serial, dev)
+				trackUSBDevPath(devPath, dev)
 			}(vendorId, productId, key, productPath, callback.DeviceRegisterEx)
 		}
 	}

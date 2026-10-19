@@ -480,8 +480,8 @@ func reserveUSBDevPath(devPath, key string) {
 
 // trackUSBDevPath will remember which registered device sits behind a USB device path.
 // Some devices (e.g. PSUs) register under a key that is not their USB serial, so the hotplug
-// monitor cannot find them on removal without this. A device that failed to initialize, or was
-// unplugged while initializing, is forgotten.
+// monitor cannot find them on removal without this. The USB path of a device that failed to
+// initialize, or was unplugged while initializing, is forgotten.
 func trackUSBDevPath(devPath string, dev *common.Device) {
 	mutex.Lock()
 	defer mutex.Unlock()

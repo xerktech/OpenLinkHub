@@ -73,8 +73,9 @@ func (f *fakePSU) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (f *fakePSU) ReadWithTimeout(p []byte, _ time.Duration) (int, error) {
+func (f *fakePSU) ReadWithTimeout(p []byte, timeout time.Duration) (int, error) {
 	if len(f.replies) == 0 {
+		time.Sleep(timeout)
 		return 0, hid.ErrTimeout
 	}
 	n := copy(p, f.replies[0])
@@ -135,6 +136,26 @@ func TestInitConcurrently(t *testing.T) {
 	if devs[0].Serial == devs[1].Serial {
 		t.Fatal("PSUs initialized at once share a serial")
 	}
+}
+
+// A reply to an earlier request that arrives after the drain is skipped, not returned as an error.
+func TestTransferSkipsLateReply(t *testing.T) {
+	d := &Device{dev: &lateReplyPSU{&fakePSU{}}}
+	output, err := d.transfer(d.createPacket(cmdInit, cmdRead, 0))
+	if err != nil {
+		t.Fatalf("transfer failed on a late reply to another request: %v", err)
+	}
+	if output[0] != cmdInit || output[1] != cmdRead {
+		t.Fatalf("transfer returned the late reply %x", output[:2])
+	}
+}
+
+// lateReplyPSU delivers a reply to an earlier request just after the request is written.
+type lateReplyPSU struct{ *fakePSU }
+
+func (l *lateReplyPSU) Write(p []byte) (int, error) {
+	l.replies = append(l.replies, []byte{cmdRead, dataGetWatts})
+	return l.fakePSU.Write(p)
 }
 
 // hungPSU never answers a read; unpluggedPSU fails every read, like a PSU pulled mid-init.
@@ -203,11 +224,12 @@ func TestInitUnpluggedPsuReturnsNil(t *testing.T) {
 	}
 }
 
-// A reply left queued by a read that timed out (or by another program polling the PSU) must not
-// be taken as the answer to the next request, or every later request would be one reply behind.
+// Replies left queued by a read that timed out (or by another program polling the PSU) must not
+// be taken as the answer to the next request, even when they answer the same command.
 func TestTransferSkipsStaleReply(t *testing.T) {
 	useFakePSUs(t)
-	psu := &fakePSU{replies: [][]byte{{cmdRead, dataGetWatts}}}
+	stale := append([]byte{cmdInit, cmdRead}, "CORSAIR RM850i PSU"...)
+	psu := &fakePSU{replies: [][]byte{stale, stale, {cmdRead, dataGetWatts}}}
 	openPath = func(string) (hidDevice, error) { return psu, nil }
 	dev := Init(0x1b1c, 7199, "7199", "/dev/hidraw0")
 	if dev == nil {

@@ -124,6 +124,7 @@ var (
 	dataPowerOut          = byte(0xee)
 	dataInputVoltage      = byte(0x88)
 	transferTimeout       = time.Second
+	maxStaleReports       = 64
 	deviceRefreshInterval = 1000
 	bufferSize            = 64
 	readBufferSize        = 64
@@ -779,9 +780,10 @@ func (d *Device) transfer(buffer []byte) ([]byte, error) {
 
 	bufferR := make([]byte, readBufferSize)
 
-	// Drop replies still queued from a read that timed out or from another program;
-	// otherwise every later read would get the previous request's reply.
-	for {
+	// Drop replies still queued from a read that timed out or from another program, so a
+	// stale reply to the same command is not taken as this one's. Capped in case another
+	// program keeps the PSU busy.
+	for i := 0; i < maxStaleReports; i++ {
 		if _, err := d.dev.ReadWithTimeout(bufferR, 0); err != nil {
 			break
 		}
@@ -792,16 +794,22 @@ func (d *Device) transfer(buffer []byte) ([]byte, error) {
 		return bufferR, err
 	}
 
-	if _, err := d.dev.ReadWithTimeout(bufferR, transferTimeout); err != nil {
-		logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Error("Unable to read data from device")
-		return bufferR, err
-	}
-
-	if buffer[1] == bufferR[0] && buffer[2] == bufferR[1] {
-		return bufferR, nil
-	} else {
-		err := errors.New("response does not match the request")
-		logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Error("Invalid response. Probably another software is monitoring this device")
-		return make([]byte, 64), err
+	// A reply to an earlier request can still arrive after the drain; skip it and keep
+	// waiting for this request's reply.
+	deadline := time.Now().Add(transferTimeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			err := errors.New("response does not match the request")
+			logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Error("Invalid response. Probably another software is monitoring this device")
+			return make([]byte, 64), err
+		}
+		if _, err := d.dev.ReadWithTimeout(bufferR, remaining); err != nil {
+			logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Error("Unable to read data from device")
+			return bufferR, err
+		}
+		if buffer[1] == bufferR[0] && buffer[2] == bufferR[1] {
+			return bufferR, nil
+		}
 	}
 }

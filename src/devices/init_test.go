@@ -24,6 +24,7 @@ type fakePSUs struct {
 func useFakePSUs(t *testing.T) *fakePSUs {
 	t.Helper()
 	f := &fakePSUs{ports: map[string]string{}, hold: map[string]chan struct{}{}, keys: map[string]string{}}
+	usePlainKeyPorts(t)
 
 	oldEnumerate, oldDevPath, oldPSU := hidEnumerate, usbDevPathOf, deviceRegisterMap[7199]
 	oldDevices, oldList, oldPaths, oldInterface := devices, deviceList, usbDevPaths, interfaceId
@@ -121,9 +122,19 @@ func wantKey(t *testing.T, f *fakePSUs, hidraw, want string) {
 	}
 }
 
+// restart forgets every device and pinned port, as if the service was restarted
+func restart() {
+	mutex.Lock()
+	devices, deviceList, usbDevPaths = map[string]*common.Device{}, map[string]Device{}, map[string]usbDevice{}
+	mutex.Unlock()
+	plainKeyMutex.Lock()
+	plainKeyPorts = map[string]string{}
+	plainKeyMutex.Unlock()
+}
+
 // startup does what Init does for HID devices, without touching real USB devices or the config folder
 func startup() {
-	listHIDDevices()
+	initHIDDevices()
 	initializeDeviceList()
 	initWG.Wait()
 }
@@ -176,4 +187,44 @@ func TestInitManualWhileIdenticalPsuInitializes(t *testing.T) {
 
 	wantKey(t, f, "hidraw0", "7199")
 	wantKey(t, f, "hidraw1", "7199-1-3")
+}
+
+// Once two identical PSUs were seen, each keeps its key across restarts and replugs, whichever
+// is found or plugged in first.
+func TestIdenticalPsusKeepKeysAcrossOrder(t *testing.T) {
+	f := useFakePSUs(t)
+	f.plug("hidraw0", "1-2", nil)
+	f.plug("hidraw1", "1-3", nil)
+	startup()
+	wantKey(t, f, "hidraw0", "7199")
+	wantKey(t, f, "hidraw1", "7199-1-3")
+
+	// Restart with only the second PSU plugged in
+	f.unplug(t, "hidraw0")
+	f.unplug(t, "hidraw1")
+	restart()
+	f.plug("hidraw2", "1-3", nil)
+	startup()
+	wantKey(t, f, "hidraw2", "7199-1-3")
+
+	// Restart with the second PSU found first
+	f.unplug(t, "hidraw2")
+	restart()
+	f.plug("hidraw3", "1-3", nil)
+	f.plug("hidraw4", "1-2", nil)
+	startup()
+	wantKey(t, f, "hidraw3", "7199-1-3")
+	wantKey(t, f, "hidraw4", "7199")
+
+	// Both unplugged, the second replugged first
+	f.unplug(t, "hidraw3")
+	f.unplug(t, "hidraw4")
+	f.plug("hidraw5", "1-3", nil)
+	InitManual(7199, "", usbRoot+"1-3")
+	initWG.Wait()
+	wantKey(t, f, "hidraw5", "7199-1-3")
+	f.plug("hidraw6", "1-2", nil)
+	InitManual(7199, "", usbRoot+"1-2")
+	initWG.Wait()
+	wantKey(t, f, "hidraw6", "7199")
 }

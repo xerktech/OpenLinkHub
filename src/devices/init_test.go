@@ -122,16 +122,19 @@ func wantKey(t *testing.T, f *fakePSUs, hidraw, want string) {
 	}
 }
 
-// restart forgets every device, as if the service was restarted
+// restart forgets every device and pinned port, as if the service was restarted
 func restart() {
 	mutex.Lock()
 	devices, deviceList, usbDevPaths = map[string]*common.Device{}, map[string]Device{}, map[string]usbDevice{}
 	mutex.Unlock()
+	plainKeyMutex.Lock()
+	plainKeyPorts = map[string]string{}
+	plainKeyMutex.Unlock()
 }
 
 // startup does what Init does for HID devices, without touching real USB devices or the config folder
 func startup() {
-	listHIDDevices()
+	initHIDDevices()
 	initializeDeviceList()
 	initWG.Wait()
 }

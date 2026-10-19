@@ -2,6 +2,8 @@ package devices
 
 import (
 	"OpenLinkHub/src/common"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -105,16 +107,16 @@ func TestReserveUSBDevPath(t *testing.T) {
 	}
 }
 
-// usePlainKeyPorts starts a test with no remembered plain key ports, and returns how often
-// they were saved instead of writing them to the config folder.
-func usePlainKeyPorts(t *testing.T) *int {
+// usePlainKeyPorts starts a test with no pinned ports, saved to a file of its own, and returns
+// that file.
+func usePlainKeyPorts(t *testing.T) string {
 	t.Helper()
-	saves := 0
-	oldPorts, oldSave := plainKeyPorts, savePlainKeyPorts
+	location := filepath.Join(t.TempDir(), "serialless.json")
+	oldPorts, oldLocation := plainKeyPorts, plainKeyPortsLocation
 	plainKeyPorts = map[string]string{}
-	savePlainKeyPorts = func(map[string]string) { saves++ }
-	t.Cleanup(func() { plainKeyPorts, savePlainKeyPorts = oldPorts, oldSave })
-	return &saves
+	plainKeyPortsLocation = func() string { return location }
+	t.Cleanup(func() { plainKeyPorts, plainKeyPortsLocation = oldPorts, oldLocation })
+	return location
 }
 
 // Once a port holds the plain key, only a PSU on that port gets it, in whatever order the PSUs
@@ -123,12 +125,12 @@ func TestSerialLessKeyPinsPlainKeyToPort(t *testing.T) {
 	const portA = "/devices/pci0000:00/0000:00:14.0/usb1/1-2"
 	const portB = "/devices/pci0000:00/0000:00:14.0/usb1/1-3"
 	none := func(string) (string, bool) { return "", false }
-	saves := usePlainKeyPorts(t)
+	location := usePlainKeyPorts(t)
 
 	if k := serialLessKey(7199, portB, "", none); k != "7199" {
 		t.Fatalf("single PSU key = %q, want \"7199\"", k)
 	}
-	if *saves != 0 {
+	if common.FileExists(location) {
 		t.Fatal("a single PSU should not pin its port")
 	}
 
@@ -140,16 +142,50 @@ func TestSerialLessKeyPinsPlainKeyToPort(t *testing.T) {
 	if k := serialLessKey(7199, portA, "", none); k != "7199" {
 		t.Fatalf("A key = %q, want \"7199\"", k)
 	}
-	// Port unknown: fall back to whether the plain key is taken
-	if k := serialLessKey(7199, "", "/dev/hidraw1", none); k != "7199" {
-		t.Fatalf("key without port = %q, want \"7199\"", k)
+	// Port unknown: it can't be the pinned port
+	if k := serialLessKey(7199, "", "/dev/hidraw1", none); k != "7199-hidraw1" {
+		t.Fatalf("key without port = %q, want \"7199-hidraw1\"", k)
+	}
+	// A stale entry left on A's own port does not cost A its key
+	stale := func(string) (string, bool) { return portA, true }
+	if k := serialLessKey(7199, portA, "", stale); k != "7199" {
+		t.Fatalf("A key with stale entry = %q, want \"7199\"", k)
 	}
 	// A PSU on the pinned port never shares the plain key
 	held := func(string) (string, bool) { return "", true }
 	if k := serialLessKey(7199, portA, "", held); k != "7199-1-2" {
 		t.Fatalf("A key while plain key held = %q, want \"7199-1-2\"", k)
 	}
-	if *saves != 0 {
+	if common.FileExists(location) {
 		t.Fatal("a pinned port should not be saved again")
+	}
+}
+
+// Pinned ports survive a restart, and a damaged file is ignored rather than crashing.
+func TestLoadPlainKeyPorts(t *testing.T) {
+	const portA = "/devices/pci0000:00/0000:00:14.0/usb1/1-2"
+	const portB = "/devices/pci0000:00/0000:00:14.0/usb1/1-3"
+	location := usePlainKeyPorts(t)
+
+	serialLessKey(7199, portB, "", func(string) (string, bool) { return portA, true })
+	plainKeyPorts = map[string]string{}
+	loadPlainKeyPorts()
+	if plainKeyPorts["7199"] != "1-2" {
+		t.Fatalf("loaded ports = %v, want 7199 on 1-2", plainKeyPorts)
+	}
+
+	for _, data := range []string{"null", "", "[]", `{"7199":5}`, `{"7199":""}`} {
+		if err := os.WriteFile(location, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+		plainKeyPorts = map[string]string{}
+		loadPlainKeyPorts()
+		if len(plainKeyPorts) != 0 {
+			t.Fatalf("file %q loaded ports %v, want none", data, plainKeyPorts)
+		}
+		// Pinning still works
+		if k := serialLessKey(7199, portB, "", func(string) (string, bool) { return portA, true }); k != "7199-1-3" {
+			t.Fatalf("file %q: B key = %q, want \"7199-1-3\"", data, k)
+		}
 	}
 }

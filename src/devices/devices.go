@@ -136,7 +136,6 @@ import (
 	"OpenLinkHub/src/version"
 	"encoding/json"
 	"github.com/sstallion/go-hid"
-	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -185,21 +184,16 @@ var (
 
 // Tests replace these to drive Init and InitManual with fake devices
 var (
-	hidEnumerate      = hid.Enumerate             // HID enumeration
-	usbDevPathOf      = common.GetShortUSBDevPath // sysfs lookup of a device USB port
-	savePlainKeyPorts = func(ports map[string]string) {
-		location := config.GetConfig().ConfigPath + plainKeyPortsFile
-		if err := common.SaveJsonData(location, ports); err != nil {
-			logger.Log(logger.Fields{"error": err, "location": location}).Error("Unable to save PSU ports")
-		}
+	hidEnumerate          = hid.Enumerate             // HID enumeration
+	usbDevPathOf          = common.GetShortUSBDevPath // sysfs lookup of a device USB port
+	plainKeyPortsLocation = func() string {           // file saving the ports of plainKeyPorts
+		return config.GetConfig().ConfigPath + "/database/serialless.json"
 	}
 )
 
-// plainKeyPortsFile remembers, per product ID, the USB port whose device holds the plain product ID
+// plainKeyPorts remembers, per product ID, the USB port whose device holds the plain product ID
 // key once identical serial-less devices (e.g. two HX1500i PSUs) were seen. Without it, whichever
 // PSU is found first takes the plain key and its profile, so PSUs swap profiles across restarts.
-const plainKeyPortsFile = "/database/serialless.json"
-
 var (
 	plainKeyMutex sync.Mutex
 	plainKeyPorts = make(map[string]string) // product ID -> USB port holding the plain key
@@ -544,9 +538,10 @@ func keyHolder(key string) (string, bool) {
 	return "", false
 }
 
-// loadPlainKeyPorts will load which USB port holds the plain key of each serial-less product
+// loadPlainKeyPorts will load which USB port holds the plain key of each serial-less product.
+// An unreadable file is ignored, so the ports are pinned again.
 func loadPlainKeyPorts() {
-	location := config.GetConfig().ConfigPath + plainKeyPortsFile
+	location := plainKeyPortsLocation()
 	if !common.FileExists(location) {
 		return
 	}
@@ -555,10 +550,26 @@ func loadPlainKeyPorts() {
 		logger.Log(logger.Fields{"error": err, "location": location}).Error("Unable to read PSU ports")
 		return
 	}
+	var ports map[string]string
+	if err = json.Unmarshal(data, &ports); err != nil {
+		logger.Log(logger.Fields{"error": err, "location": location}).Error("Unable to decode PSU ports")
+		return
+	}
 	plainKeyMutex.Lock()
 	defer plainKeyMutex.Unlock()
-	if err = json.Unmarshal(data, &plainKeyPorts); err != nil {
-		logger.Log(logger.Fields{"error": err, "location": location}).Error("Unable to decode PSU ports")
+	plainKeyPorts = make(map[string]string)
+	for key, port := range ports {
+		if len(port) > 0 {
+			plainKeyPorts[key] = port
+		}
+	}
+}
+
+// savePlainKeyPorts will save which USB port holds the plain key of each serial-less product
+func savePlainKeyPorts() {
+	location := plainKeyPortsLocation()
+	if err := common.SaveJsonData(location, plainKeyPorts); err != nil {
+		logger.Log(logger.Fields{"error": err, "location": location}).Error("Unable to save PSU ports")
 	}
 }
 
@@ -579,8 +590,11 @@ func serialLessKey(productId uint16, devPath, hidPath string, holder func(string
 	plainKeyMutex.Lock()
 	defer plainKeyMutex.Unlock()
 	holderPath, held := holder(key)
-	if owner, pinned := plainKeyPorts[key]; pinned && len(devPath) > 0 {
-		if port == owner && !held {
+	// A stale entry for this same port (its removal was missed) is not another device
+	held = held && (len(devPath) == 0 || holderPath != devPath)
+	if owner, pinned := plainKeyPorts[key]; pinned {
+		// A device on an unknown port can't be the pinned one, so it never takes the plain key
+		if len(devPath) > 0 && port == owner && !held {
 			return key
 		}
 		return key + "-" + port
@@ -588,9 +602,9 @@ func serialLessKey(productId uint16, devPath, hidPath string, holder func(string
 	if !held {
 		return key
 	}
-	if _, pinned := plainKeyPorts[key]; !pinned && len(holderPath) > 0 {
+	if len(holderPath) > 0 {
 		plainKeyPorts[key] = filepath.Base(holderPath)
-		savePlainKeyPorts(maps.Clone(plainKeyPorts))
+		savePlainKeyPorts()
 	}
 	return key + "-" + port
 }
@@ -697,6 +711,12 @@ func InitManual(productId uint16, key, devPath string) {
 }
 
 // listHIDDevices will add all compatible HID devices to the device list
+// initHIDDevices will list HID devices, keying identical serial-less devices by their saved ports
+func initHIDDevices() {
+	loadPlainKeyPorts()
+	listHIDDevices()
+}
+
 func listHIDDevices() {
 	enum := hid.EnumFunc(func(info *hid.DeviceInfo) error {
 		logger.Log(
@@ -803,8 +823,7 @@ func Init() {
 		logger.Log(logger.Fields{"error": err}).Fatal("Unable to initialize HID interface")
 	}
 
-	loadPlainKeyPorts()
-	listHIDDevices()
+	initHIDDevices()
 
 	// Memory
 	if config.GetConfig().Memory {

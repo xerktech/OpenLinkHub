@@ -68,6 +68,7 @@ type DeviceProfile struct {
 
 type Device struct {
 	dev *hid.Device
+	key string // devices.go key; "<productId>-<usb port>" for an identical second PSU
 	// Per device, not package globals: with two PSUs, a stop sent on a shared channel
 	// could reach the wrong refresh loop or block forever once the listener had gone.
 	timer           *time.Ticker
@@ -90,6 +91,7 @@ type Device struct {
 
 var (
 	pwd                   = ""
+	pwdOnce               sync.Once
 	cmdInit               = byte(0xfe)
 	cmdRead               = byte(0x03)
 	cmdWrite              = byte(0x02)
@@ -116,9 +118,9 @@ var (
 	temperatureChannels   = 2
 )
 
-func Init(vendorId, productId uint16, _, path string) *common.Device {
+func Init(vendorId, productId uint16, key, path string) *common.Device {
 	// Set global working directory
-	pwd = config.GetConfig().ConfigPath
+	pwdOnce.Do(func() { pwd = config.GetConfig().ConfigPath }) // PSUs initialize concurrently
 
 	// Open device, return if failure
 	dev, err := hid.OpenPath(path)
@@ -142,6 +144,7 @@ func Init(vendorId, productId uint16, _, path string) *common.Device {
 			10: "100 %",
 		},
 		IsPSU: true,
+		key:   key,
 	}
 
 	// Bootstrap
@@ -253,10 +256,19 @@ func (d *Device) getProductData() {
 	product = strings.Replace(product, " PSU", "", -1)
 
 	d.Product = product
+	d.Serial = serialFromKey(product, d.key)
+}
 
-	hash := md5.Sum([]byte(product))
-	serial := hex.EncodeToString(hash[:])
-	d.Serial = serial
+// serialFromKey will derive the PSU serial from its product name, since PSUs have no USB serial.
+// Two identical PSUs would share it (and their profile), so the USB port suffix of a second
+// PSU's key is mixed in. A single PSU keeps its existing serial and profile.
+func serialFromKey(product, key string) string {
+	seed := product
+	if i := strings.Index(key, "-"); i >= 0 {
+		seed = product + key[i:]
+	}
+	hash := md5.Sum([]byte(seed))
+	return hex.EncodeToString(hash[:])
 }
 
 // UpdatePsuFan will update PSU fan speed

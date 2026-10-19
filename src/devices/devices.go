@@ -175,7 +175,7 @@ var (
 	interfaceId         = 0
 	devices             = make(map[string]*common.Device)
 	deviceList          = make(map[string]Device)
-	usbDevPaths         = make(map[string]string) // USB sysfs device path -> registered device serial
+	usbDevPaths         = make(map[string]usbDevice) // USB sysfs device path -> registered device
 	legacyDevices       = []uint16{3080, 3081, 3082, 3090, 3091, 3093, 7168}
 	initWG              sync.WaitGroup
 	Dispatch            dispatcher.DeviceDispatcher = CallDeviceMethod
@@ -460,10 +460,16 @@ func GetDevicesEx() map[string]*common.Device {
 	return out
 }
 
+// usbDevice is a registered device behind a USB device path
+type usbDevice struct {
+	serial string // Serial the device registered under
+	key    string // Key the device was initialized with
+}
+
 // trackUSBDevPath will remember which registered device sits behind a USB device path.
 // Some devices (e.g. PSUs) register under a key that is not their USB serial, so the hotplug
 // monitor cannot find them on removal without this.
-func trackUSBDevPath(path string, dev *common.Device) {
+func trackUSBDevPath(path, key string, dev *common.Device) {
 	if dev == nil {
 		return
 	}
@@ -472,7 +478,7 @@ func trackUSBDevPath(path string, dev *common.Device) {
 		return
 	}
 	mutex.Lock()
-	usbDevPaths[devPath] = dev.Serial
+	usbDevPaths[devPath] = usbDevice{serial: dev.Serial, key: key}
 	mutex.Unlock()
 }
 
@@ -480,11 +486,38 @@ func trackUSBDevPath(path string, dev *common.Device) {
 func TakeSerialByDevPath(devPath string) (string, bool) {
 	mutex.Lock()
 	defer mutex.Unlock()
-	serial, ok := usbDevPaths[devPath]
+	dev, ok := usbDevPaths[devPath]
 	if ok {
 		delete(usbDevPaths, devPath)
 	}
-	return serial, ok
+	return dev.serial, ok
+}
+
+// keyRegistered will return true if a plugged device was initialized with given key
+func keyRegistered(key string) bool {
+	mutex.Lock()
+	defer mutex.Unlock()
+	for _, dev := range usbDevPaths {
+		if dev.key == key {
+			return true
+		}
+	}
+	return false
+}
+
+// serialLessKey will return the key for a device with no serial: its product ID. When an identical
+// device already holds that key (e.g. two HX1500i PSUs), it is suffixed with the device USB port,
+// or with its HID path when the port is unknown, so both devices are kept apart.
+func serialLessKey(productId uint16, devPath, hidPath string, taken func(string) bool) string {
+	key := strconv.Itoa(int(productId))
+	if !taken(key) {
+		return key
+	}
+	port := filepath.Base(devPath)
+	if len(devPath) == 0 {
+		port = filepath.Base(hidPath)
+	}
+	return key + "-" + port
 }
 
 // InitManual will initialize device manually when plugged in. devPath is the USB sysfs device
@@ -551,7 +584,7 @@ func InitManual(productId uint16, key, devPath string) {
 			if len(key) == 0 {
 				key = info.SerialNbr
 				if len(key) == 0 {
-					key = strconv.Itoa(int(info.ProductID))
+					key = serialLessKey(info.ProductID, devPath, info.Path, keyRegistered)
 				}
 			}
 
@@ -647,7 +680,10 @@ func Init() {
 			key := info.SerialNbr
 			if len(key) == 0 {
 				// Devices with no serial, make serial based of productId
-				key = strconv.Itoa(int(info.ProductID))
+				key = serialLessKey(info.ProductID, p, info.Path, func(k string) bool {
+					_, ok := deviceList[k]
+					return ok
+				})
 			}
 
 			if interfaceId == 1 || interfaceId == 3 || interfaceId == 4 {
@@ -939,7 +975,7 @@ func initializeDevice(productId uint16, key, productPath string) {
 				defer initWG.Done()
 				dev := cb(vid, pid, serial, path)
 				addDevice(dev)
-				trackUSBDevPath(path, dev)
+				trackUSBDevPath(path, serial, dev)
 			}(vendorId, productId, key, productPath, callback.DeviceRegister)
 		}
 
@@ -949,7 +985,7 @@ func initializeDevice(productId uint16, key, productPath string) {
 				defer initWG.Done()
 				dev := cb(vid, pid, serial, path, addDevice)
 				addDevice(dev)
-				trackUSBDevPath(path, dev)
+				trackUSBDevPath(path, serial, dev)
 			}(vendorId, productId, key, productPath, callback.DeviceRegisterEx)
 		}
 	}

@@ -47,6 +47,11 @@ func TestSerialLessKeyKeepsIdenticalDevicesApart(t *testing.T) {
 	if k := serialLessKey(7199, "", "/dev/hidraw1", inList); k != "7199-hidraw1" {
 		t.Fatalf("key without port = %q, want \"7199-hidraw1\"", k)
 	}
+	// Neither port known: the holder's unknown port is not this device's
+	unknown := func(string) (string, bool) { return "", true }
+	if k := serialLessKey(7203, "", "/dev/hidraw2", unknown); k != "7203-hidraw2" {
+		t.Fatalf("key with both ports unknown = %q, want \"7203-hidraw2\"", k)
+	}
 
 	usbDevPaths[portA] = usbDevice{serial: "serialA", key: keyA}
 	usbDevPaths[portB] = usbDevice{serial: "serialB", key: keyB}

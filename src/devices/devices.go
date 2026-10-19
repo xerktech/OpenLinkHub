@@ -710,13 +710,13 @@ func InitManual(productId uint16, key, devPath string) {
 	}
 }
 
-// listHIDDevices will add all compatible HID devices to the device list
 // initHIDDevices will list HID devices, keying identical serial-less devices by their saved ports
 func initHIDDevices() {
 	loadPlainKeyPorts()
 	listHIDDevices()
 }
 
+// listHIDDevices will add all compatible HID devices to the device list
 func listHIDDevices() {
 	enum := hid.EnumFunc(func(info *hid.DeviceInfo) error {
 		logger.Log(

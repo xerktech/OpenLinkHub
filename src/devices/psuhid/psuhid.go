@@ -779,6 +779,14 @@ func (d *Device) transfer(buffer []byte) ([]byte, error) {
 
 	bufferR := make([]byte, readBufferSize)
 
+	// Drop replies still queued from a read that timed out or from another program;
+	// otherwise every later read would get the previous request's reply.
+	for {
+		if _, err := d.dev.ReadWithTimeout(bufferR, 0); err != nil {
+			break
+		}
+	}
+
 	if _, err := d.dev.Write(buffer); err != nil {
 		logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Error("Unable to write to a device")
 		return bufferR, err

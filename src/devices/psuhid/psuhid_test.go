@@ -54,22 +54,32 @@ func TestSerialFromKeyKeepsIdenticalPsusApart(t *testing.T) {
 }
 
 // fakePSU answers every request like an HX1500i: it echoes the command and reports its product name.
-type fakePSU struct{ reply []byte }
+// Replies queue up until read, like hidraw input reports.
+type fakePSU struct {
+	replies [][]byte
+	closed  bool
+}
 
 func (f *fakePSU) GetMfrStr() (string, error) { return "CORSAIR", nil }
-func (f *fakePSU) Close() error               { return nil }
+func (f *fakePSU) Close() error               { f.closed = true; return nil }
 
 func (f *fakePSU) Write(p []byte) (int, error) {
-	f.reply = make([]byte, readBufferSize)
-	f.reply[0], f.reply[1] = p[1], p[2]
+	reply := make([]byte, readBufferSize)
+	reply[0], reply[1] = p[1], p[2]
 	if p[1] == cmdInit && p[2] == cmdRead {
-		copy(f.reply[2:], "CORSAIR HX1500i PSU")
+		copy(reply[2:], "CORSAIR HX1500i PSU")
 	}
+	f.replies = append(f.replies, reply)
 	return len(p), nil
 }
 
 func (f *fakePSU) ReadWithTimeout(p []byte, _ time.Duration) (int, error) {
-	return copy(p, f.reply), nil
+	if len(f.replies) == 0 {
+		return 0, hid.ErrTimeout
+	}
+	n := copy(p, f.replies[0])
+	f.replies = f.replies[1:]
+	return n, nil
 }
 
 // useFakePSUs makes Init open a fake PSU at any path and keep profiles in a temporary folder.
@@ -132,6 +142,9 @@ type hungPSU struct{ fakePSU }
 type unpluggedPSU struct{ fakePSU }
 
 func (h *hungPSU) ReadWithTimeout(p []byte, timeout time.Duration) (int, error) {
+	if timeout < 0 {
+		select {} // hidapi blocks forever on a negative timeout
+	}
 	time.Sleep(timeout)
 	return 0, hid.ErrTimeout
 }
@@ -179,9 +192,29 @@ func TestHungPsuDoesNotBlockOthers(t *testing.T) {
 // never remove it again.
 func TestInitUnpluggedPsuReturnsNil(t *testing.T) {
 	useFakePSUs(t)
-	openPath = func(string) (hidDevice, error) { return &unpluggedPSU{}, nil }
+	psu := &unpluggedPSU{}
+	openPath = func(string) (hidDevice, error) { return psu, nil }
 	if dev := Init(0x1b1c, 7199, "7199", "/dev/hidraw0"); dev != nil {
 		dev.Instance.(*Device).StopDirty()
 		t.Fatal("Init of an unplugged PSU returned a device")
+	}
+	if !psu.closed {
+		t.Fatal("Init left the unplugged PSU's HID handle open")
+	}
+}
+
+// A reply left queued by a read that timed out (or by another program polling the PSU) must not
+// be taken as the answer to the next request, or every later request would be one reply behind.
+func TestTransferSkipsStaleReply(t *testing.T) {
+	useFakePSUs(t)
+	psu := &fakePSU{replies: [][]byte{{cmdRead, dataGetWatts}}}
+	openPath = func(string) (hidDevice, error) { return psu, nil }
+	dev := Init(0x1b1c, 7199, "7199", "/dev/hidraw0")
+	if dev == nil {
+		t.Fatal("a stale queued reply made Init fail")
+	}
+	dev.Instance.(*Device).StopDirty()
+	if dev.Product != "HX1500i" {
+		t.Fatalf("product = %q, want HX1500i", dev.Product)
 	}
 }

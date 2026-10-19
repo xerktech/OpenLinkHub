@@ -189,7 +189,7 @@ func (d *Device) Stop() {
 func (d *Device) StopDirty() uint8 {
 	logger.Log(logger.Fields{"serial": d.Serial}).Info("Stopping device (dirty)...")
 	d.stopAutoRefresh()
-	return 1
+	return 2 // USB only, remove it from the device list
 }
 
 // GetDeviceTemplate will return device template name

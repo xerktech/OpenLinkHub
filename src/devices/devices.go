@@ -524,7 +524,12 @@ func InitManual(productId uint16, key, devPath string) {
 
 			// Without a serial, identical devices (e.g. two PSUs) are told apart by their USB port
 			if len(key) == 0 && len(devPath) > 0 {
-				if p, _ := common.GetShortUSBDevPath(filepath.Base(info.Path)); p != devPath {
+				p, err := common.GetShortUSBDevPath(filepath.Base(info.Path))
+				if err != nil {
+					logger.Log(logger.Fields{"error": err, "path": info.Path, "devPath": devPath}).Warn("Unable to resolve USB port of device, skipping")
+					return nil
+				}
+				if p != devPath {
 					return nil
 				}
 			}

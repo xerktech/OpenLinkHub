@@ -75,10 +75,10 @@ func useFakePSUs(t *testing.T) {
 		t.Fatal(err)
 	}
 	pwdOnce.Do(func() {}) // Init must not overwrite pwd with the (unset) config path
+	oldPwd, oldOpen := pwd, openPath
 	pwd = dir
-	old := openPath
 	openPath = func(string) (hidDevice, error) { return &fakePSU{}, nil }
-	t.Cleanup(func() { openPath = old })
+	t.Cleanup(func() { pwd, openPath = oldPwd, oldOpen })
 }
 
 // Init registers a PSU under the serial derived from the key devices.go gave it, so an identical

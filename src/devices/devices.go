@@ -642,18 +642,8 @@ func InitManual(productId uint16, key, devPath string) {
 	}
 }
 
-// Init will initialize all compatible Corsair devices in your system
-func Init() {
-	logger.Log(logger.Fields{
-		"buildVersion": version.GetBuildInfo().BuildVersion,
-		"build":        version.GetBuildInfo().Revision,
-	}).Info("Application build")
-
-	// Initialize general HID interface
-	if err := hid.Init(); err != nil {
-		logger.Log(logger.Fields{"error": err}).Fatal("Unable to initialize HID interface")
-	}
-
+// listHIDDevices will add all compatible HID devices to the device list
+func listHIDDevices() {
 	enum := hid.EnumFunc(func(info *hid.DeviceInfo) error {
 		logger.Log(
 			logger.Fields{
@@ -732,6 +722,21 @@ func Init() {
 	if err != nil {
 		logger.Log(logger.Fields{"error": err, "vendorId": scufVendorId}).Fatal("Unable to enumerate devices")
 	}
+}
+
+// Init will initialize all compatible Corsair devices in your system
+func Init() {
+	logger.Log(logger.Fields{
+		"buildVersion": version.GetBuildInfo().BuildVersion,
+		"build":        version.GetBuildInfo().Revision,
+	}).Info("Application build")
+
+	// Initialize general HID interface
+	if err := hid.Init(); err != nil {
+		logger.Log(logger.Fields{"error": err}).Fatal("Unable to initialize HID interface")
+	}
+
+	listHIDDevices()
 
 	// Memory
 	if config.GetConfig().Memory {

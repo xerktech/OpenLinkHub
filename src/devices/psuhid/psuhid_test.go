@@ -1,8 +1,13 @@
 package psuhid
 
 import (
+	"OpenLinkHub/src/common"
 	"crypto/md5"
 	"encoding/hex"
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -42,5 +47,77 @@ func TestSerialFromKeyKeepsIdenticalPsusApart(t *testing.T) {
 	}
 	if third := serialFromKey("HX1500i", "7199-1-4"); third == second {
 		t.Fatal("PSUs on different ports share a serial")
+	}
+}
+
+// fakePSU answers every request like an HX1500i: it echoes the command and reports its product name.
+type fakePSU struct{ reply []byte }
+
+func (f *fakePSU) GetMfrStr() (string, error) { return "CORSAIR", nil }
+func (f *fakePSU) Close() error               { return nil }
+
+func (f *fakePSU) Write(p []byte) (int, error) {
+	f.reply = make([]byte, readBufferSize)
+	f.reply[0], f.reply[1] = p[1], p[2]
+	if p[1] == cmdInit && p[2] == cmdRead {
+		copy(f.reply[2:], "CORSAIR HX1500i PSU")
+	}
+	return len(p), nil
+}
+
+func (f *fakePSU) Read(p []byte) (int, error) { return copy(p, f.reply), nil }
+
+// useFakePSUs makes Init open a fake PSU at any path and keep profiles in a temporary folder.
+func useFakePSUs(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "database/profiles"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	pwdOnce.Do(func() {}) // Init must not overwrite pwd with the (unset) config path
+	oldPwd, oldOpen := pwd, openPath
+	pwd = dir
+	openPath = func(string) (hidDevice, error) { return &fakePSU{}, nil }
+	t.Cleanup(func() { pwd, openPath = oldPwd, oldOpen })
+}
+
+// Init registers a PSU under the serial derived from the key devices.go gave it, so an identical
+// second PSU keyed with its USB port gets its own serial.
+func TestInitUsesKeyForSerial(t *testing.T) {
+	useFakePSUs(t)
+	for _, key := range []string{"7199", "7199-1-3"} {
+		dev := Init(0x1b1c, 7199, key, "/dev/hidraw0")
+		if dev == nil {
+			t.Fatalf("Init(%q) returned nil", key)
+		}
+		dev.Instance.(*Device).StopDirty()
+		if want := serialFromKey("HX1500i", key); dev.Serial != want {
+			t.Fatalf("Init(%q) serial = %q, want %q", key, dev.Serial, want)
+		}
+	}
+}
+
+// Two PSUs initialize at once at startup; run with -race.
+func TestInitConcurrently(t *testing.T) {
+	useFakePSUs(t)
+	keys := []string{"7199", "7199-1-3"}
+	devs := make([]*common.Device, len(keys))
+	var wg sync.WaitGroup
+	for i, key := range keys {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			devs[i] = Init(0x1b1c, 7199, key, "/dev/hidraw"+strconv.Itoa(i))
+		}()
+	}
+	wg.Wait()
+	for i, dev := range devs {
+		if dev == nil {
+			t.Fatalf("Init(%q) returned nil", keys[i])
+		}
+		dev.Instance.(*Device).StopDirty()
+	}
+	if devs[0].Serial == devs[1].Serial {
+		t.Fatal("PSUs initialized at once share a serial")
 	}
 }

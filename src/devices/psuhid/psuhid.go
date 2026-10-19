@@ -66,8 +66,19 @@ type DeviceProfile struct {
 	RgbOff  bool
 }
 
+// hidDevice is the part of *hid.Device a PSU uses; tests replace it with a fake PSU
+type hidDevice interface {
+	GetMfrStr() (string, error)
+	Write(p []byte) (int, error)
+	Read(p []byte) (int, error)
+	Close() error
+}
+
+// openPath opens the HID device of a PSU; tests point it at a fake PSU
+var openPath = func(path string) (hidDevice, error) { return hid.OpenPath(path) }
+
 type Device struct {
-	dev *hid.Device
+	dev hidDevice
 	key string // devices.go key; "<productId>-<usb port>" for an identical second PSU
 	// Per device, not package globals: with two PSUs, a stop sent on a shared channel
 	// could reach the wrong refresh loop or block forever once the listener had gone.
@@ -123,7 +134,7 @@ func Init(vendorId, productId uint16, key, path string) *common.Device {
 	pwdOnce.Do(func() { pwd = config.GetConfig().ConfigPath }) // PSUs initialize concurrently
 
 	// Open device, return if failure
-	dev, err := hid.OpenPath(path)
+	dev, err := openPath(path)
 	if err != nil {
 		logger.Log(logger.Fields{"error": err, "vendorId": vendorId, "productId": productId, "path": path}).Error("Unable to open HID device")
 		return nil

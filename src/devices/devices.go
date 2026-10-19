@@ -181,6 +181,12 @@ var (
 	Dispatch            dispatcher.DeviceDispatcher = CallDeviceMethod
 )
 
+// Tests replace these to drive Init and InitManual with fake devices
+var (
+	hidEnumerate = hid.Enumerate             // HID enumeration
+	usbDevPathOf = common.GetShortUSBDevPath // sysfs lookup of a device USB port
+)
+
 // Stop will stop all active devices
 func Stop() {
 	// Stop all cluster operations
@@ -572,7 +578,7 @@ func InitManual(productId uint16, key, devPath string) {
 
 			// Without a serial, identical devices (e.g. two PSUs) are told apart by their USB port
 			if len(key) == 0 && len(devPath) > 0 {
-				p, err := common.GetShortUSBDevPath(filepath.Base(info.Path))
+				p, err := usbDevPathOf(filepath.Base(info.Path))
 				if err != nil {
 					logger.Log(logger.Fields{"error": err, "path": info.Path, "devPath": devPath}).Warn("Unable to resolve USB port of device, skipping")
 					return nil
@@ -616,13 +622,13 @@ func InitManual(productId uint16, key, devPath string) {
 	})
 
 	// Enumerate all Corsair devices
-	err := hid.Enumerate(vendorId, productId, enum)
+	err := hidEnumerate(vendorId, productId, enum)
 	if err != nil {
 		logger.Log(logger.Fields{"error": err, "vendorId": vendorId}).Fatal("Unable to enumerate devices")
 	}
 
 	// Enumerate all Scuf devices
-	err = hid.Enumerate(scufVendorId, productId, enum)
+	err = hidEnumerate(scufVendorId, productId, enum)
 	if err != nil {
 		logger.Log(logger.Fields{"error": err, "vendorId": scufVendorId}).Fatal("Unable to enumerate devices")
 	}
@@ -636,18 +642,8 @@ func InitManual(productId uint16, key, devPath string) {
 	}
 }
 
-// Init will initialize all compatible Corsair devices in your system
-func Init() {
-	logger.Log(logger.Fields{
-		"buildVersion": version.GetBuildInfo().BuildVersion,
-		"build":        version.GetBuildInfo().Revision,
-	}).Info("Application build")
-
-	// Initialize general HID interface
-	if err := hid.Init(); err != nil {
-		logger.Log(logger.Fields{"error": err}).Fatal("Unable to initialize HID interface")
-	}
-
+// listHIDDevices will add all compatible HID devices to the device list
+func listHIDDevices() {
 	enum := hid.EnumFunc(func(info *hid.DeviceInfo) error {
 		logger.Log(
 			logger.Fields{
@@ -690,7 +686,7 @@ func Init() {
 				}
 			}
 			base := filepath.Base(info.Path)
-			p, _ := common.GetShortUSBDevPath(base)
+			p, _ := usbDevPathOf(base)
 
 			key := info.SerialNbr
 			if len(key) == 0 {
@@ -716,16 +712,44 @@ func Init() {
 	})
 
 	// Enumerate all Corsair devices
-	err := hid.Enumerate(vendorId, hid.ProductIDAny, enum)
+	err := hidEnumerate(vendorId, hid.ProductIDAny, enum)
 	if err != nil {
 		logger.Log(logger.Fields{"error": err, "vendorId": vendorId}).Fatal("Unable to enumerate devices")
 	}
 
 	// Enumerate all Scuf devices
-	err = hid.Enumerate(scufVendorId, hid.ProductIDAny, enum)
+	err = hidEnumerate(scufVendorId, hid.ProductIDAny, enum)
 	if err != nil {
 		logger.Log(logger.Fields{"error": err, "vendorId": scufVendorId}).Fatal("Unable to enumerate devices")
 	}
+}
+
+// initializeDeviceList will initialize all listed devices not excluded via config.json
+func initializeDeviceList() {
+	for key, product := range deviceList {
+		productId := product.ProductId
+		productPath := product.Path
+		if slices.Contains(config.GetConfig().Exclude, productId) {
+			logger.Log(logger.Fields{"productId": productId}).Warn("Product excluded via config.json")
+			continue
+		}
+		initializeDevice(productId, key, productPath)
+	}
+}
+
+// Init will initialize all compatible Corsair devices in your system
+func Init() {
+	logger.Log(logger.Fields{
+		"buildVersion": version.GetBuildInfo().BuildVersion,
+		"build":        version.GetBuildInfo().Revision,
+	}).Info("Application build")
+
+	// Initialize general HID interface
+	if err := hid.Init(); err != nil {
+		logger.Log(logger.Fields{"error": err}).Fatal("Unable to initialize HID interface")
+	}
+
+	listHIDDevices()
 
 	// Memory
 	if config.GetConfig().Memory {
@@ -774,15 +798,7 @@ func Init() {
 	}
 
 	// USB-HID
-	for key, product := range deviceList {
-		productId := product.ProductId
-		productPath := product.Path
-		if slices.Contains(config.GetConfig().Exclude, productId) {
-			logger.Log(logger.Fields{"productId": productId}).Warn("Product excluded via config.json")
-			continue
-		}
-		initializeDevice(productId, key, productPath)
-	}
+	initializeDeviceList()
 
 	if config.GetConfig().EnableOpenRGBTargetServer {
 		initWG.Wait()
@@ -984,7 +1000,7 @@ var deviceRegisterMap = map[uint16]Product{
 func initializeDevice(productId uint16, key, productPath string) {
 	callback, ok := deviceRegisterMap[productId]
 	if ok {
-		devPath, err := common.GetShortUSBDevPath(filepath.Base(productPath))
+		devPath, err := usbDevPathOf(filepath.Base(productPath))
 		if err == nil {
 			reserveUSBDevPath(devPath, key)
 		}

@@ -37,4 +37,5 @@ jobs:
       - name: Test
         env:
           CGO_CFLAGS_ALLOW: -fno-strict-overflow
-        run: go test ./...
+        # -race: PSUs initialize concurrently (see psuhid TestInitConcurrently)
+        run: go test -race ./...

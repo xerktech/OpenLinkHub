@@ -181,6 +181,12 @@ var (
 	Dispatch            dispatcher.DeviceDispatcher = CallDeviceMethod
 )
 
+// Tests replace these to drive Init and InitManual with fake devices
+var (
+	hidEnumerate = hid.Enumerate             // HID enumeration
+	usbDevPathOf = common.GetShortUSBDevPath // sysfs lookup of a device USB port
+)
+
 // Stop will stop all active devices
 func Stop() {
 	// Stop all cluster operations
@@ -572,7 +578,7 @@ func InitManual(productId uint16, key, devPath string) {
 
 			// Without a serial, identical devices (e.g. two PSUs) are told apart by their USB port
 			if len(key) == 0 && len(devPath) > 0 {
-				p, err := common.GetShortUSBDevPath(filepath.Base(info.Path))
+				p, err := usbDevPathOf(filepath.Base(info.Path))
 				if err != nil {
 					logger.Log(logger.Fields{"error": err, "path": info.Path, "devPath": devPath}).Warn("Unable to resolve USB port of device, skipping")
 					return nil
@@ -616,13 +622,13 @@ func InitManual(productId uint16, key, devPath string) {
 	})
 
 	// Enumerate all Corsair devices
-	err := hid.Enumerate(vendorId, productId, enum)
+	err := hidEnumerate(vendorId, productId, enum)
 	if err != nil {
 		logger.Log(logger.Fields{"error": err, "vendorId": vendorId}).Fatal("Unable to enumerate devices")
 	}
 
 	// Enumerate all Scuf devices
-	err = hid.Enumerate(scufVendorId, productId, enum)
+	err = hidEnumerate(scufVendorId, productId, enum)
 	if err != nil {
 		logger.Log(logger.Fields{"error": err, "vendorId": scufVendorId}).Fatal("Unable to enumerate devices")
 	}
@@ -690,7 +696,7 @@ func Init() {
 				}
 			}
 			base := filepath.Base(info.Path)
-			p, _ := common.GetShortUSBDevPath(base)
+			p, _ := usbDevPathOf(base)
 
 			key := info.SerialNbr
 			if len(key) == 0 {
@@ -716,13 +722,13 @@ func Init() {
 	})
 
 	// Enumerate all Corsair devices
-	err := hid.Enumerate(vendorId, hid.ProductIDAny, enum)
+	err := hidEnumerate(vendorId, hid.ProductIDAny, enum)
 	if err != nil {
 		logger.Log(logger.Fields{"error": err, "vendorId": vendorId}).Fatal("Unable to enumerate devices")
 	}
 
 	// Enumerate all Scuf devices
-	err = hid.Enumerate(scufVendorId, hid.ProductIDAny, enum)
+	err = hidEnumerate(scufVendorId, hid.ProductIDAny, enum)
 	if err != nil {
 		logger.Log(logger.Fields{"error": err, "vendorId": scufVendorId}).Fatal("Unable to enumerate devices")
 	}
@@ -984,7 +990,7 @@ var deviceRegisterMap = map[uint16]Product{
 func initializeDevice(productId uint16, key, productPath string) {
 	callback, ok := deviceRegisterMap[productId]
 	if ok {
-		devPath, err := common.GetShortUSBDevPath(filepath.Base(productPath))
+		devPath, err := usbDevPathOf(filepath.Base(productPath))
 		if err == nil {
 			reserveUSBDevPath(devPath, key)
 		}

@@ -124,9 +124,7 @@ func wantKey(t *testing.T, f *fakePSUs, hidraw, want string) {
 // startup does what Init does for HID devices, without touching real USB devices or the config folder
 func startup() {
 	listHIDDevices()
-	for key, product := range deviceList {
-		initializeDevice(product.ProductId, key, product.Path)
-	}
+	initializeDeviceList()
 	initWG.Wait()
 }
 

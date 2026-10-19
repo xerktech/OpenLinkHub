@@ -724,6 +724,19 @@ func listHIDDevices() {
 	}
 }
 
+// initializeDeviceList will initialize all listed devices not excluded via config.json
+func initializeDeviceList() {
+	for key, product := range deviceList {
+		productId := product.ProductId
+		productPath := product.Path
+		if slices.Contains(config.GetConfig().Exclude, productId) {
+			logger.Log(logger.Fields{"productId": productId}).Warn("Product excluded via config.json")
+			continue
+		}
+		initializeDevice(productId, key, productPath)
+	}
+}
+
 // Init will initialize all compatible Corsair devices in your system
 func Init() {
 	logger.Log(logger.Fields{
@@ -785,15 +798,7 @@ func Init() {
 	}
 
 	// USB-HID
-	for key, product := range deviceList {
-		productId := product.ProductId
-		productPath := product.Path
-		if slices.Contains(config.GetConfig().Exclude, productId) {
-			logger.Log(logger.Fields{"productId": productId}).Warn("Product excluded via config.json")
-			continue
-		}
-		initializeDevice(productId, key, productPath)
-	}
+	initializeDeviceList()
 
 	if config.GetConfig().EnableOpenRGBTargetServer {
 		initWG.Wait()

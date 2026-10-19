@@ -158,6 +158,52 @@ func (l *lateReplyPSU) Write(p []byte) (int, error) {
 	return l.fakePSU.Write(p)
 }
 
+// chattyPSU answers every read at once with a reply to some other request, like a PSU another
+// program is polling hard; trickleReply answers one read late with such a reply, then goes quiet.
+type chattyPSU struct{ fakePSU }
+type trickleReply struct {
+	fakePSU
+	sent bool
+}
+
+func (c *chattyPSU) ReadWithTimeout(p []byte, _ time.Duration) (int, error) {
+	return copy(p, []byte{cmdRead, dataGetWatts}), nil
+}
+
+func (r *trickleReply) ReadWithTimeout(p []byte, timeout time.Duration) (int, error) {
+	if timeout > 0 && !r.sent {
+		r.sent = true
+		time.Sleep(transferTimeout * 6 / 10)
+		return copy(p, []byte{cmdRead, dataGetWatts}), nil
+	}
+	time.Sleep(timeout)
+	return 0, hid.ErrTimeout
+}
+
+// Neither a stream of other replies nor a slow one may stretch a transfer past its timeout.
+func TestTransferTimeoutIsTotal(t *testing.T) {
+	for name, dev := range map[string]hidDevice{"chatty": &chattyPSU{}, "trickle": &trickleReply{}} {
+		d := &Device{dev: dev}
+		done := make(chan error)
+		start := time.Now()
+		go func() {
+			_, err := d.transfer(d.createPacket(cmdInit, cmdRead, 0))
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("%s: transfer accepted a reply to another request", name)
+			}
+			if elapsed := time.Since(start); elapsed > transferTimeout*13/10 {
+				t.Fatalf("%s: transfer took %v, timeout is %v", name, elapsed, transferTimeout)
+			}
+		case <-time.After(3 * transferTimeout):
+			t.Fatalf("%s: transfer never gave up", name)
+		}
+	}
+}
+
 // hungPSU never answers a read; unpluggedPSU fails every read, like a PSU pulled mid-init.
 type hungPSU struct{ fakePSU }
 type unpluggedPSU struct{ fakePSU }

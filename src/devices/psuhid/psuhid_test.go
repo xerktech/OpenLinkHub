@@ -1,7 +1,6 @@
 package psuhid
 
 import (
-	"OpenLinkHub/src/logger"
 	"testing"
 	"time"
 )
@@ -9,7 +8,6 @@ import (
 // StopDirty must return 2 so devices.StopDirty drops the unplugged PSU from the device list,
 // and must stop a running refresh loop without blocking.
 func TestStopDirtyRemovesDevice(t *testing.T) {
-	logger.Init()
 	d := &Device{Serial: "x"}
 	d.setAutoRefresh()
 

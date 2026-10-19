@@ -70,7 +70,7 @@ type DeviceProfile struct {
 type hidDevice interface {
 	GetMfrStr() (string, error)
 	Write(p []byte) (int, error)
-	Read(p []byte) (int, error)
+	ReadWithTimeout(p []byte, timeout time.Duration) (int, error)
 	Close() error
 }
 
@@ -79,7 +79,9 @@ var openPath = func(path string) (hidDevice, error) { return hid.OpenPath(path) 
 
 type Device struct {
 	dev hidDevice
-	key string // devices.go key; "<productId>-<usb port>" for an identical second PSU
+	// Per device: a PSU that stops answering must not hold up the others
+	mutex sync.Mutex
+	key   string // devices.go key; "<productId>-<usb port>" for an identical second PSU
 	// Per device, not package globals: with two PSUs, a stop sent on a shared channel
 	// could reach the wrong refresh loop or block forever once the listener had gone.
 	timer           *time.Ticker
@@ -121,7 +123,7 @@ var (
 	dataGetWatts          = byte(0x96)
 	dataPowerOut          = byte(0xee)
 	dataInputVoltage      = byte(0x88)
-	mutex                 sync.Mutex
+	transferTimeout       = time.Second
 	deviceRefreshInterval = 1000
 	bufferSize            = 64
 	readBufferSize        = 64
@@ -159,8 +161,13 @@ func Init(vendorId, productId uint16, key, path string) *common.Device {
 	}
 
 	// Bootstrap
-	d.getManufacturer()    // Manufacturer
-	d.getProductData()     // Product data
+	d.getManufacturer() // Manufacturer
+	if err = d.getProductData(); err != nil {
+		// Unplugged or unresponsive: registering it would leave a device hotplug can't remove
+		logger.Log(logger.Fields{"error": err, "productId": productId, "path": path}).Error("Unable to read PSU product data")
+		_ = dev.Close()
+		return nil
+	}
 	d.loadDeviceProfiles() // Load all device profiles
 	d.getInputVoltage()    // Input voltage
 	d.getDevices()         // Get devices
@@ -254,11 +261,11 @@ func (d *Device) getManufacturer() {
 }
 
 // getProductData will get product data
-func (d *Device) getProductData() {
+func (d *Device) getProductData() error {
 	packet := d.createPacket(cmdInit, cmdRead, 0)
 	output, err := d.transfer(packet)
 	if err != nil {
-		logger.Log(logger.Fields{"error": err}).Error("Unable to init to PSU device")
+		return err
 	}
 
 	product := string(output[2:])
@@ -268,6 +275,7 @@ func (d *Device) getProductData() {
 
 	d.Product = product
 	d.Serial = serialFromKey(product, d.key)
+	return nil
 }
 
 // serialFromKey will derive the PSU serial from its product name, since PSUs have no USB serial.
@@ -766,8 +774,8 @@ func (d *Device) stopAutoRefresh() {
 
 // transfer will send data to a device and retrieve device output
 func (d *Device) transfer(buffer []byte) ([]byte, error) {
-	mutex.Lock()
-	defer mutex.Unlock()
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
 
 	bufferR := make([]byte, readBufferSize)
 
@@ -776,7 +784,7 @@ func (d *Device) transfer(buffer []byte) ([]byte, error) {
 		return bufferR, err
 	}
 
-	if _, err := d.dev.Read(bufferR); err != nil {
+	if _, err := d.dev.ReadWithTimeout(bufferR, transferTimeout); err != nil {
 		logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Error("Unable to read data from device")
 		return bufferR, err
 	}

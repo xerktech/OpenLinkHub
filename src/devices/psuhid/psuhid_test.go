@@ -4,12 +4,15 @@ import (
 	"OpenLinkHub/src/common"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/sstallion/go-hid"
 )
 
 // StopDirty must return 2 so devices.StopDirty drops the unplugged PSU from the device list,
@@ -65,7 +68,9 @@ func (f *fakePSU) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (f *fakePSU) Read(p []byte) (int, error) { return copy(p, f.reply), nil }
+func (f *fakePSU) ReadWithTimeout(p []byte, _ time.Duration) (int, error) {
+	return copy(p, f.reply), nil
+}
 
 // useFakePSUs makes Init open a fake PSU at any path and keep profiles in a temporary folder.
 func useFakePSUs(t *testing.T) {
@@ -119,5 +124,64 @@ func TestInitConcurrently(t *testing.T) {
 	}
 	if devs[0].Serial == devs[1].Serial {
 		t.Fatal("PSUs initialized at once share a serial")
+	}
+}
+
+// hungPSU never answers a read; unpluggedPSU fails every read, like a PSU pulled mid-init.
+type hungPSU struct{ fakePSU }
+type unpluggedPSU struct{ fakePSU }
+
+func (h *hungPSU) ReadWithTimeout(p []byte, timeout time.Duration) (int, error) {
+	time.Sleep(timeout)
+	return 0, hid.ErrTimeout
+}
+
+func (u *unpluggedPSU) ReadWithTimeout([]byte, time.Duration) (int, error) {
+	return 0, errors.New("device disconnected")
+}
+
+// A PSU that never answers must not block another PSU's init, and its own init must give up.
+func TestHungPsuDoesNotBlockOthers(t *testing.T) {
+	useFakePSUs(t)
+	openPath = func(path string) (hidDevice, error) {
+		if path == "/dev/hung" {
+			return &hungPSU{}, nil
+		}
+		return &fakePSU{}, nil
+	}
+	hung := make(chan *common.Device)
+	go func() { hung <- Init(0x1b1c, 7199, "7199", "/dev/hung") }()
+	time.Sleep(100 * time.Millisecond) // the hung PSU is now waiting on its first read
+
+	done := make(chan *common.Device)
+	go func() { done <- Init(0x1b1c, 7199, "7199-1-3", "/dev/hidraw1") }()
+	select {
+	case dev := <-done:
+		if dev == nil {
+			t.Fatal("Init of the healthy PSU returned nil")
+		}
+		dev.Instance.(*Device).StopDirty()
+	case <-time.After(transferTimeout / 2):
+		t.Fatal("a hung PSU blocked another PSU's init")
+	}
+
+	select {
+	case dev := <-hung:
+		if dev != nil {
+			t.Fatal("Init of a PSU that never answers returned a device")
+		}
+	case <-time.After(5 * transferTimeout):
+		t.Fatal("Init of a hung PSU never returned")
+	}
+}
+
+// A PSU unplugged during init must not be registered: its USB path is gone, so hotplug could
+// never remove it again.
+func TestInitUnpluggedPsuReturnsNil(t *testing.T) {
+	useFakePSUs(t)
+	openPath = func(string) (hidDevice, error) { return &unpluggedPSU{}, nil }
+	if dev := Init(0x1b1c, 7199, "7199", "/dev/hidraw0"); dev != nil {
+		dev.Instance.(*Device).StopDirty()
+		t.Fatal("Init of an unplugged PSU returned a device")
 	}
 }

@@ -134,7 +134,9 @@ import (
 	"OpenLinkHub/src/smbus"
 	"OpenLinkHub/src/usb"
 	"OpenLinkHub/src/version"
+	"encoding/json"
 	"github.com/sstallion/go-hid"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -183,8 +185,24 @@ var (
 
 // Tests replace these to drive Init and InitManual with fake devices
 var (
-	hidEnumerate = hid.Enumerate             // HID enumeration
-	usbDevPathOf = common.GetShortUSBDevPath // sysfs lookup of a device USB port
+	hidEnumerate      = hid.Enumerate             // HID enumeration
+	usbDevPathOf      = common.GetShortUSBDevPath // sysfs lookup of a device USB port
+	savePlainKeyPorts = func(ports map[string]string) {
+		location := config.GetConfig().ConfigPath + plainKeyPortsFile
+		if err := common.SaveJsonData(location, ports); err != nil {
+			logger.Log(logger.Fields{"error": err, "location": location}).Error("Unable to save PSU ports")
+		}
+	}
+)
+
+// plainKeyPortsFile remembers, per product ID, the USB port whose device holds the plain product ID
+// key once identical serial-less devices (e.g. two HX1500i PSUs) were seen. Without it, whichever
+// PSU is found first takes the plain key and its profile, so PSUs swap profiles across restarts.
+const plainKeyPortsFile = "/database/serialless.json"
+
+var (
+	plainKeyMutex sync.Mutex
+	plainKeyPorts = make(map[string]string) // product ID -> USB port holding the plain key
 )
 
 // Stop will stop all active devices
@@ -514,29 +532,65 @@ func TakeSerialByDevPath(devPath string) (string, bool) {
 	return dev.serial, ok && len(dev.serial) > 0
 }
 
-// keyRegistered will return true if a plugged device was initialized with given key
-func keyRegistered(key string) bool {
+// keyHolder will return the USB device path of the plugged device initialized with given key
+func keyHolder(key string) (string, bool) {
 	mutex.Lock()
 	defer mutex.Unlock()
-	for _, dev := range usbDevPaths {
+	for devPath, dev := range usbDevPaths {
 		if dev.key == key {
-			return true
+			return devPath, true
 		}
 	}
-	return false
+	return "", false
+}
+
+// loadPlainKeyPorts will load which USB port holds the plain key of each serial-less product
+func loadPlainKeyPorts() {
+	location := config.GetConfig().ConfigPath + plainKeyPortsFile
+	if !common.FileExists(location) {
+		return
+	}
+	data, err := os.ReadFile(location)
+	if err != nil {
+		logger.Log(logger.Fields{"error": err, "location": location}).Error("Unable to read PSU ports")
+		return
+	}
+	plainKeyMutex.Lock()
+	defer plainKeyMutex.Unlock()
+	if err = json.Unmarshal(data, &plainKeyPorts); err != nil {
+		logger.Log(logger.Fields{"error": err, "location": location}).Error("Unable to decode PSU ports")
+	}
 }
 
 // serialLessKey will return the key for a device with no serial: its product ID. When an identical
 // device already holds that key (e.g. two HX1500i PSUs), it is suffixed with the device USB port,
-// or with its HID path when the port is unknown, so both devices are kept apart.
-func serialLessKey(productId uint16, devPath, hidPath string, taken func(string) bool) string {
+// or with its HID path when the port is unknown, so both devices are kept apart. holder returns
+// the USB device path of the device holding a key.
+// The USB port of the device holding the plain key is then remembered, and from then on only a
+// device on that port gets the plain key, whatever order the devices are found or plugged in.
+// A single device is never pinned, so it keeps its key on any port.
+func serialLessKey(productId uint16, devPath, hidPath string, holder func(string) (string, bool)) string {
 	key := strconv.Itoa(int(productId))
-	if !taken(key) {
-		return key
-	}
 	port := filepath.Base(devPath)
 	if len(devPath) == 0 {
 		port = filepath.Base(hidPath)
+	}
+
+	plainKeyMutex.Lock()
+	defer plainKeyMutex.Unlock()
+	holderPath, held := holder(key)
+	if owner, pinned := plainKeyPorts[key]; pinned && len(devPath) > 0 {
+		if port == owner && !held {
+			return key
+		}
+		return key + "-" + port
+	}
+	if !held {
+		return key
+	}
+	if _, pinned := plainKeyPorts[key]; !pinned && len(holderPath) > 0 {
+		plainKeyPorts[key] = filepath.Base(holderPath)
+		savePlainKeyPorts(maps.Clone(plainKeyPorts))
 	}
 	return key + "-" + port
 }
@@ -605,7 +659,7 @@ func InitManual(productId uint16, key, devPath string) {
 			if len(key) == 0 {
 				key = info.SerialNbr
 				if len(key) == 0 {
-					key = serialLessKey(info.ProductID, devPath, info.Path, keyRegistered)
+					key = serialLessKey(info.ProductID, devPath, info.Path, keyHolder)
 				}
 			}
 
@@ -691,9 +745,9 @@ func listHIDDevices() {
 			key := info.SerialNbr
 			if len(key) == 0 {
 				// Devices with no serial, make serial based of productId
-				key = serialLessKey(info.ProductID, p, info.Path, func(k string) bool {
-					_, ok := deviceList[k]
-					return ok
+				key = serialLessKey(info.ProductID, p, info.Path, func(k string) (string, bool) {
+					d, ok := deviceList[k]
+					return d.DevPath, ok
 				})
 			}
 
@@ -749,6 +803,7 @@ func Init() {
 		logger.Log(logger.Fields{"error": err}).Fatal("Unable to initialize HID interface")
 	}
 
+	loadPlainKeyPorts()
 	listHIDDevices()
 
 	// Memory

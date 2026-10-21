@@ -352,3 +352,24 @@ func TestReplugStopsReplacedInstance(t *testing.T) {
 		t.Fatal("serial-7199 is not the new instance")
 	}
 }
+
+// Re-adding the same instance, or replacing a device that is not a PSU, stops nothing: other
+// devices stay listed after an unplug already stopped them, and a second StopDirty panics.
+func TestAddDeviceStopsOnlyReplacedPsus(t *testing.T) {
+	useFakePSUs(t)
+	psu := &stopCounter{}
+	dev := &common.Device{ProductType: common.ProductTypePSUHid, Serial: "psu", Instance: psu}
+	addDevice(dev)
+	addDevice(&common.Device{ProductType: common.ProductTypePSUHid, Serial: "psu", Instance: psu})
+	cc := &stopCounter{}
+	addDevice(&common.Device{ProductType: common.ProductTypeCC, Serial: "cc", Instance: cc})
+	addDevice(&common.Device{ProductType: common.ProductTypeCC, Serial: "cc", Instance: &stopCounter{}})
+	initWG.Wait()
+
+	if psu.stopped != 0 {
+		t.Fatalf("re-added PSU instance stopped %d times, want 0", psu.stopped)
+	}
+	if cc.stopped != 0 {
+		t.Fatalf("replaced non-PSU instance stopped %d times, want 0", cc.stopped)
+	}
+}

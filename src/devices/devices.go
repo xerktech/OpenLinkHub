@@ -548,15 +548,15 @@ func TakeSerialByDevPath(devPath string, productId uint16) (string, bool) {
 }
 
 // keyHolder will return the USB device path of the plugged device initialized with given key.
-// The path is empty when the holder's USB port is unknown. Such a holder whose HID node is gone
-// was unplugged unnoticed and no longer holds the key.
-func keyHolder(key string) (string, bool) {
+// The path is empty when the holder's USB port is unknown. Such a holder whose HID node is gone,
+// or is hidPath of the device asking, was unplugged unnoticed and no longer holds the key.
+func keyHolder(key, hidPath string) (string, bool) {
 	mutex.Lock()
 	defer mutex.Unlock()
 	for devPath, dev := range usbDevPaths {
 		if dev.key == key {
 			if dev.portless {
-				if !hidNodeExists(devPath) {
+				if devPath == hidPath || !hidNodeExists(devPath) {
 					continue
 				}
 				return "", true
@@ -702,7 +702,9 @@ func InitManual(productId uint16, key, devPath string) {
 			if len(key) == 0 {
 				key = info.SerialNbr
 				if len(key) == 0 {
-					key = serialLessKey(info.ProductID, devPath, info.Path, keyHolder)
+					key = serialLessKey(info.ProductID, devPath, info.Path, func(k string) (string, bool) {
+						return keyHolder(k, info.Path)
+					})
 				}
 			}
 

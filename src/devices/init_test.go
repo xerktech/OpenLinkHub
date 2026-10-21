@@ -283,3 +283,20 @@ func TestUnplugPortlessPsu(t *testing.T) {
 	initWG.Wait()
 	wantKey(t, f, "hidraw1", "7199")
 }
+
+// A port-less PSU whose unplug was missed, replugged on its old HID node, keeps its key.
+func TestReplugPortlessPsuAfterMissedUnplug(t *testing.T) {
+	f := useFakePSUs(t)
+	f.plug("hidraw0", "", nil)
+	startup()
+	wantKey(t, f, "hidraw0", "7199")
+
+	// Unplugged without the monitor noticing, then plugged back on a port that now resolves
+	f.mu.Lock()
+	f.plugged = nil
+	f.mu.Unlock()
+	f.plug("hidraw0", "1-3", nil)
+	InitManual(7199, "", usbRoot+"1-3")
+	initWG.Wait()
+	wantKey(t, f, "hidraw0", "7199")
+}

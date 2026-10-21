@@ -492,15 +492,20 @@ type usbDevice struct {
 
 // reserveUSBDevPath will remember the key a device behind a USB device path is initialized with.
 // It is recorded before the device initializes, so an identical device plugged in meanwhile
-// does not take the same key. A device whose USB port can't be resolved is recorded under its
-// HID path, so it still holds its key.
-func reserveUSBDevPath(devPath, key string, productId uint16, portless bool) {
+// does not take the same key. A device whose USB port can't be resolved (empty devPath) is
+// recorded under its HID path, so it still holds its key.
+func reserveUSBDevPath(devPath, hidPath, key string, productId uint16) {
+	mutex.Lock()
+	defer mutex.Unlock()
+	// The HID node now belongs to this device; a port-less device on it was unplugged unnoticed
+	if dev, ok := usbDevPaths[hidPath]; ok && dev.portless {
+		delete(usbDevPaths, hidPath)
+	}
 	if len(devPath) == 0 {
+		usbDevPaths[hidPath] = usbDevice{key: key, productId: productId, portless: true}
 		return
 	}
-	mutex.Lock()
-	usbDevPaths[devPath] = usbDevice{key: key, productId: productId, portless: portless}
-	mutex.Unlock()
+	usbDevPaths[devPath] = usbDevice{key: key, productId: productId}
 }
 
 // trackUSBDevPath will remember which registered device sits behind a USB device path.
@@ -1099,11 +1104,13 @@ func initializeDevice(productId uint16, key, productPath string) {
 	callback, ok := deviceRegisterMap[productId]
 	if ok {
 		devPath, err := usbDevPathOf(filepath.Base(productPath))
-		portless := err != nil
-		if portless {
-			devPath = productPath
+		if err != nil {
+			devPath = ""
 		}
-		reserveUSBDevPath(devPath, key, productId, portless)
+		reserveUSBDevPath(devPath, productPath, key, productId)
+		if len(devPath) == 0 {
+			devPath = productPath // registered under its HID path
+		}
 
 		if callback.DeviceRegister != nil {
 			initWG.Add(1)

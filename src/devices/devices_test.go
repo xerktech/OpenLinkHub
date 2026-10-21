@@ -84,7 +84,7 @@ func TestReserveUSBDevPath(t *testing.T) {
 	const portB = "/devices/pci0000:00/0000:00:14.0/usb1/1-3"
 	t.Cleanup(func() { delete(usbDevPaths, portA); delete(usbDevPaths, portB) })
 
-	reserveUSBDevPath(portA, "7199", 7199, false)
+	reserveUSBDevPath(portA, "/dev/hidraw9", "7199", 7199)
 	if k := serialLessKey(7199, portB, "", keyHolder); k != "7199-1-3" {
 		t.Fatalf("key while A initializes = %q, want \"7199-1-3\"", k)
 	}
@@ -98,14 +98,14 @@ func TestReserveUSBDevPath(t *testing.T) {
 	}
 
 	// Failed to initialize: the key is released
-	reserveUSBDevPath(portA, "7199", 7199, false)
+	reserveUSBDevPath(portA, "/dev/hidraw9", "7199", 7199)
 	trackUSBDevPath(portA, nil)
 	if _, held := keyHolder("7199"); held {
 		t.Fatal("key of a device that failed to initialize should be released")
 	}
 
 	// Registered: the serial is kept under the reserved key
-	reserveUSBDevPath(portB, "7199-1-3", 7199, false)
+	reserveUSBDevPath(portB, "/dev/hidraw9", "7199-1-3", 7199)
 	trackUSBDevPath(portB, &common.Device{Serial: "serialB"})
 	if serial, ok := TakeSerialByDevPath(portB, 7199); !ok || serial != "serialB" {
 		t.Fatalf("got (%q, %v), want (\"serialB\", true)", serial, ok)
@@ -237,5 +237,23 @@ func TestKeyHolderPortless(t *testing.T) {
 	present = false
 	if _, ok := keyHolder("7199"); ok {
 		t.Fatal("an unplugged device still holds its key")
+	}
+}
+
+// A device initialized on the HID node of a port-less device unplugged unnoticed takes over the
+// node, so the port-less device no longer holds its key.
+func TestReserveReplacesStalePortless(t *testing.T) {
+	const portA = "/devices/pci0000:00/0000:00:14.0/usb1/1-2"
+	oldNode, oldPaths := hidNodeExists, usbDevPaths
+	hidNodeExists = func(string) bool { return true }
+	usbDevPaths = map[string]usbDevice{"/dev/hidraw0": {serial: "serialA", key: "7199", productId: 7199, portless: true}}
+	t.Cleanup(func() { hidNodeExists, usbDevPaths = oldNode, oldPaths })
+
+	reserveUSBDevPath(portA, "/dev/hidraw0", "abc", 2000)
+	if _, ok := keyHolder("7199"); ok {
+		t.Fatal("a port-less device unplugged unnoticed still holds its key")
+	}
+	if path, ok := keyHolder("abc"); !ok || path != portA {
+		t.Fatalf("got (%q, %v), want (%q, true)", path, ok, portA)
 	}
 }

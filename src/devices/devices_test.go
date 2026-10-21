@@ -287,6 +287,27 @@ func TestReserveForgetsStalePortlessKey(t *testing.T) {
 	}
 }
 
+// A twin reserved next to a port-less device still plugged in leaves that device's entry alone, so
+// its removal is still found.
+func TestReserveKeepsLivePortless(t *testing.T) {
+	const portB = "/devices/pci0000:00/0000:00:14.0/usb1/7-10"
+	present := map[string]bool{"/dev/hidraw0": true}
+	oldNode, oldPaths := hidNodeHolds, usbDevPaths
+	hidNodeHolds = func(path string, _ uint16) bool { return present[path] }
+	usbDevPaths = map[string]usbDevice{"/dev/hidraw0": {serial: "serial-7199", key: "7199", productId: 7199, portless: true}}
+	t.Cleanup(func() { hidNodeHolds, usbDevPaths = oldNode, oldPaths })
+
+	reserveUSBDevPath(portB, "/dev/hidraw1", "7199-7-10", 7199)
+	reserveUSBDevPath("", "/dev/hidraw2", "7199-hidraw2", 7199)
+	if _, ok := usbDevPaths["/dev/hidraw0"]; !ok {
+		t.Fatal("forgot a port-less device still plugged in")
+	}
+	delete(present, "/dev/hidraw0")
+	if serial, ok := TakeSerialByDevPath("/devices/pci0000:00/0000:00:14.0/usb1/9-9", 7199); !ok || serial != "serial-7199" {
+		t.Fatalf("got (%q, %v), want (\"serial-7199\", true)", serial, ok)
+	}
+}
+
 // A HID node is held by a device only while it exists and sysfs reports that device's vendor and
 // product on it.
 func TestHidNodeHolds(t *testing.T) {

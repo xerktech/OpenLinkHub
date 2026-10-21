@@ -549,7 +549,7 @@ func unzipFile(src, dest string) error {
 		if strings.Contains(f.Name, "..") {
 			return fmt.Errorf("illegal path: %s", f.Name)
 		}
-		
+
 		cleanName, err := validateArchiveEntry(f)
 		if err != nil {
 			return err

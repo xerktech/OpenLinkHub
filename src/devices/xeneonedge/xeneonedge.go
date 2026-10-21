@@ -265,7 +265,7 @@ func (d *Device) ProcessGetWidget(widgetId int) interface{} {
 		if widget.Widget == nil {
 			continue
 		}
-		
+
 		if widget.Widget.Id == widgetId {
 			return widget.Widget
 		}

@@ -12,12 +12,12 @@ func TestTakeSerialByDevPath(t *testing.T) {
 	usbDevPaths[devPath] = usbDevice{serial: "abc123", key: "7199"}
 	t.Cleanup(func() { delete(usbDevPaths, devPath) })
 
-	serial, ok := TakeSerialByDevPath(devPath)
+	serial, ok := TakeSerialByDevPath(devPath, 7199)
 	if !ok || serial != "abc123" {
 		t.Fatalf("got (%q, %v), want (\"abc123\", true)", serial, ok)
 	}
 	// The mapping is consumed so a later replug on the same port registers fresh
-	if _, ok = TakeSerialByDevPath(devPath); ok {
+	if _, ok = TakeSerialByDevPath(devPath, 7199); ok {
 		t.Fatal("mapping should be removed after it is taken")
 	}
 }
@@ -58,14 +58,14 @@ func TestSerialLessKeyKeepsIdenticalDevicesApart(t *testing.T) {
 	t.Cleanup(func() { delete(usbDevPaths, portA); delete(usbDevPaths, portB) })
 
 	// Hotplug: B replugged while A is still plugged must not take A's key
-	TakeSerialByDevPath(portB)
+	TakeSerialByDevPath(portB, 7199)
 	if k := serialLessKey(7199, portB, "", keyHolder); k != keyB {
 		t.Fatalf("B replug key = %q, want %q", k, keyB)
 	}
 	usbDevPaths[portB] = usbDevice{serial: "serialB", key: keyB}
 
 	// Hotplug: A replugged while B is still plugged gets its own key back
-	TakeSerialByDevPath(portA)
+	TakeSerialByDevPath(portA, 7199)
 	if k := serialLessKey(7199, portA, "", keyHolder); k != keyA {
 		t.Fatalf("A replug key = %q, want %q", k, keyA)
 	}
@@ -84,12 +84,12 @@ func TestReserveUSBDevPath(t *testing.T) {
 	const portB = "/devices/pci0000:00/0000:00:14.0/usb1/1-3"
 	t.Cleanup(func() { delete(usbDevPaths, portA); delete(usbDevPaths, portB) })
 
-	reserveUSBDevPath(portA, "7199")
+	reserveUSBDevPath(portA, "7199", 7199, false)
 	if k := serialLessKey(7199, portB, "", keyHolder); k != "7199-1-3" {
 		t.Fatalf("key while A initializes = %q, want \"7199-1-3\"", k)
 	}
 	// Unplugged while initializing: nothing to stop yet, and the late registration is not kept
-	if _, ok := TakeSerialByDevPath(portA); ok {
+	if _, ok := TakeSerialByDevPath(portA, 7199); ok {
 		t.Fatal("device still initializing should report no serial")
 	}
 	trackUSBDevPath(portA, &common.Device{Serial: "serialA"})
@@ -98,16 +98,16 @@ func TestReserveUSBDevPath(t *testing.T) {
 	}
 
 	// Failed to initialize: the key is released
-	reserveUSBDevPath(portA, "7199")
+	reserveUSBDevPath(portA, "7199", 7199, false)
 	trackUSBDevPath(portA, nil)
 	if _, held := keyHolder("7199"); held {
 		t.Fatal("key of a device that failed to initialize should be released")
 	}
 
 	// Registered: the serial is kept under the reserved key
-	reserveUSBDevPath(portB, "7199-1-3")
+	reserveUSBDevPath(portB, "7199-1-3", 7199, false)
 	trackUSBDevPath(portB, &common.Device{Serial: "serialB"})
-	if serial, ok := TakeSerialByDevPath(portB); !ok || serial != "serialB" {
+	if serial, ok := TakeSerialByDevPath(portB, 7199); !ok || serial != "serialB" {
 		t.Fatalf("got (%q, %v), want (\"serialB\", true)", serial, ok)
 	}
 }

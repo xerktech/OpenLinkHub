@@ -420,3 +420,99 @@ func TestReplugNotHeldUpByReplacedInstance(t *testing.T) {
 		}
 	}
 }
+
+// countStops makes each PSU initialization a stopCounter, returned by serial; read it once
+// initializations are done
+func countStops(t *testing.T) map[string]*stopCounter {
+	t.Helper()
+	register := deviceRegisterMap[7199]
+	instances := map[string]*stopCounter{}
+	var mu sync.Mutex // startup initializes PSUs in parallel
+	deviceRegisterMap[7199] = Product{Name: register.Name, DeviceRegister: func(vid, pid uint16, key, path string) *common.Device {
+		dev := register.DeviceRegister(vid, pid, key, path)
+		s := &stopCounter{}
+		mu.Lock()
+		instances[dev.Serial] = s
+		mu.Unlock()
+		dev.Instance = s
+		return dev
+	}}
+	return instances
+}
+
+func wantListed(t *testing.T, serial string, want bool) {
+	t.Helper()
+	mutex.Lock()
+	_, ok := devices[serial]
+	mutex.Unlock()
+	if ok != want {
+		t.Fatalf("%s listed = %v, want %v", serial, ok, want)
+	}
+}
+
+// A port-less PSU whose unplug was missed and that came back on a known port leaves a stale
+// entry; it is dropped and its device stopped on replug, so a later unplug of its twin takes the twin.
+func TestStalePortlessPsuDoesNotSwallowTwinRemoval(t *testing.T) {
+	f := useFakePSUs(t)
+	instances := countStops(t)
+	f.plug("hidraw0", "", nil)
+	f.plug("hidraw1", "", nil)
+	startup()
+	wantKey(t, f, "hidraw0", "7199")
+	wantKey(t, f, "hidraw1", "7199-hidraw1")
+
+	// B is unplugged without the monitor noticing, then plugged back on a port that resolves
+	f.mu.Lock()
+	f.plugged = f.plugged[:1]
+	f.mu.Unlock()
+	f.plug("hidraw2", "7-10", nil)
+	InitManual(7199, "", usbRoot+"7-10")
+	initWG.Wait()
+	wantKey(t, f, "hidraw2", "7199-7-10")
+	wantListed(t, "serial-7199-hidraw1", false)
+	if n := instances["serial-7199-hidraw1"].stopped; n != 1 {
+		t.Fatalf("stale instance stopped %d times, want 1", n)
+	}
+	if n := instances["serial-7199"].stopped; n != 0 {
+		t.Fatalf("live twin stopped %d times, want 0", n)
+	}
+
+	f.unplug(t, "hidraw0")
+	initWG.Wait()
+	wantListed(t, "serial-7199", false)
+	wantListed(t, "serial-7199-7-10", true)
+	for serial, s := range instances {
+		if serial != "serial-7199-hidraw1" && s.stopped != 0 {
+			t.Errorf("%s stopped %d times, want 0", serial, s.stopped) // the monitor stops the one unplugged
+		}
+	}
+}
+
+// Two port-less PSUs both unplugged, one unnoticed, can't be told apart on the noticed unplug;
+// the one not taken is stopped, and neither is left listed.
+func TestUnplugTakesEveryGonePortlessPsu(t *testing.T) {
+	f := useFakePSUs(t)
+	instances := countStops(t)
+	f.plug("hidraw0", "", nil)
+	f.plug("hidraw1", "", nil)
+	startup()
+
+	f.mu.Lock()
+	f.plugged = f.plugged[:1] // B is unplugged without the monitor noticing
+	f.mu.Unlock()
+	f.unplug(t, "hidraw0")
+	initWG.Wait()
+	mutex.Lock()
+	left := len(devices)
+	mutex.Unlock()
+	if left != 0 {
+		t.Fatalf("%d devices listed after both PSUs are unplugged, want 0", left)
+	}
+	stops := 0
+	for _, s := range instances {
+		stops += s.stopped
+	}
+	if stops != 1 { // the monitor stops the one taken
+		t.Fatalf("got %d stops, want 1", stops)
+	}
+}

@@ -204,7 +204,7 @@ func TestTakeSerialByDevPathPortless(t *testing.T) {
 	const usbPath = "/devices/pci0000:00/0000:00:14.0/usb1/1-9"
 	present := map[string]bool{"/dev/hidraw0": true}
 	oldNode, oldPaths := hidNodeHolds, usbDevPaths
-	hidNodeHolds = func(path string, _ uint16) bool { return present[path] }
+	hidNodeHolds = func(path string, productId uint16) bool { return present[path] && productId == 7199 }
 	usbDevPaths = map[string]usbDevice{
 		"/dev/hidraw0": {serial: "serialA", key: "7199", productId: 7199, portless: true},
 		"/dev/hidraw1": {key: "7199-hidraw1", productId: 7199, portless: true},
@@ -265,6 +265,28 @@ func TestReserveReplacesStalePortless(t *testing.T) {
 	}
 }
 
+// A device that takes the key of a port-less device unplugged unnoticed shares its serial, so the
+// stale entry is forgotten; a later removal of a twin must not take the live device.
+func TestReserveForgetsStalePortlessKey(t *testing.T) {
+	const portA, portB = "/devices/pci0000:00/0000:00:14.0/usb1/7-9", "/devices/pci0000:00/0000:00:14.0/usb1/7-10"
+	oldNode, oldPaths := hidNodeHolds, usbDevPaths
+	hidNodeHolds = func(string, uint16) bool { return false } // hidraw0 was taken by another vendor
+	usbDevPaths = map[string]usbDevice{"/dev/hidraw0": {serial: "serial-7199", key: "7199", productId: 7199, portless: true}}
+	t.Cleanup(func() { hidNodeHolds, usbDevPaths = oldNode, oldPaths })
+
+	reserveUSBDevPath(portA, "/dev/hidraw2", "7199", 7199)
+	trackUSBDevPath(portA, &common.Device{Serial: "serial-7199"})
+	if _, ok := usbDevPaths["/dev/hidraw0"]; ok {
+		t.Fatal("kept the entry of a port-less device whose key was taken")
+	}
+	if serial, ok := TakeSerialByDevPath(portB, 7199); ok {
+		t.Fatalf("removal of an unregistered twin took %q", serial)
+	}
+	if serial, ok := TakeSerialByDevPath(portA, 7199); !ok || serial != "serial-7199" {
+		t.Fatalf("got (%q, %v), want (\"serial-7199\", true)", serial, ok)
+	}
+}
+
 // A HID node is held by a device only while it exists and sysfs reports that device's vendor and
 // product on it.
 func TestHidNodeHolds(t *testing.T) {
@@ -289,6 +311,9 @@ func TestHidNodeHolds(t *testing.T) {
 		}
 		return path
 	}
+	twoFields := node("hidraw5", "HID_ID=0003:00001B1C\n")
+	garbage := node("hidraw6", "HID_ID=0003:zz:00001C1F\n")
+	foreignSamePID := node("hidraw7", "HID_ID=0003:0000046D:00001C1F\n")
 	psu := node("hidraw0", "DRIVER=hid-generic\nHID_ID=0003:00001B1C:00001C1F\nHID_NAME=Corsair HX1500i\n")
 	foreign := node("hidraw1", "DRIVER=hid-generic\nHID_ID=0003:0000046D:0000C52B\nHID_NAME=Logitech USB Receiver\n")
 	otherPSU := node("hidraw2", "HID_ID=0003:00001B1C:00001C20\n")
@@ -303,6 +328,9 @@ func TestHidNodeHolds(t *testing.T) {
 		{"another vendor", foreign, false},
 		{"another product", otherPSU, false},
 		{"owner unknown", unknown, true},
+		{"HID_ID with two fields", twoFields, true},
+		{"unparsable HID_ID", garbage, true},
+		{"another vendor, same product ID", foreignSamePID, false},
 		{"node gone", filepath.Join(dir, "hidraw4"), false},
 	} {
 		if got := hidNodeHolds(tc.path, 7199); got != tc.want {

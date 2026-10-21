@@ -533,9 +533,13 @@ type usbDevice struct {
 func reserveUSBDevPath(devPath, hidPath, key string, productId uint16) {
 	mutex.Lock()
 	defer mutex.Unlock()
-	// The HID node now belongs to this device; a port-less device on it was unplugged unnoticed
-	if dev, ok := usbDevPaths[hidPath]; ok && dev.portless {
-		delete(usbDevPaths, hidPath)
+	// A port-less device on this HID node, or holding this key, was unplugged unnoticed: keyHolder
+	// only lets a device take a port-less device's key once that device is gone. Left behind, its
+	// entry shares this device's serial and a later removal of a twin would take this device.
+	for path, dev := range usbDevPaths {
+		if dev.portless && (path == hidPath || dev.key == key) {
+			delete(usbDevPaths, path)
+		}
 	}
 	if len(devPath) == 0 {
 		usbDevPaths[hidPath] = usbDevice{key: key, productId: productId, portless: true}

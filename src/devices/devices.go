@@ -440,8 +440,19 @@ func addDevice(device *common.Device) {
 	}
 
 	mutex.Lock()
+	replaced, ok := devices[device.Serial]
 	devices[device.Serial] = device
 	mutex.Unlock()
+
+	// A device whose unplug was missed can come back under the same serial (serial-less
+	// devices derive it from their key). Its old instance is unreachable once replaced, so
+	// stop it the way an unplug would; its node is gone, so not with a full Stop.
+	if ok && replaced.Instance != nil && replaced.Instance != device.Instance {
+		if method := reflect.ValueOf(replaced.Instance).MethodByName("StopDirty"); method.IsValid() {
+			logger.Log(logger.Fields{"serial": device.Serial}).Warn("Replacing a device registered under the same serial")
+			method.Call(nil)
+		}
+	}
 
 	CallDeviceMethod(device.Serial, "SetDispatcher", Dispatch)
 }

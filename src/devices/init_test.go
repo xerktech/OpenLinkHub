@@ -303,3 +303,52 @@ func TestReplugPortlessPsuAfterMissedUnplug(t *testing.T) {
 	initWG.Wait()
 	wantKey(t, f, "hidraw0", "7199")
 }
+
+// stopCounter stands in for a device instance and counts how often it was stopped dirty
+type stopCounter struct{ stopped int }
+
+func (s *stopCounter) StopDirty() uint8 {
+	s.stopped++
+	return 2
+}
+
+// A PSU that replaces one registered under the same serial stops the instance it replaces.
+func TestReplugStopsReplacedInstance(t *testing.T) {
+	f := useFakePSUs(t)
+	register := deviceRegisterMap[7199]
+	var instances []*stopCounter
+	deviceRegisterMap[7199] = Product{Name: register.Name, DeviceRegister: func(vid, pid uint16, key, path string) *common.Device {
+		dev := register.DeviceRegister(vid, pid, key, path)
+		s := &stopCounter{}
+		instances = append(instances, s) // initializations run one at a time here
+		dev.Instance = s
+		return dev
+	}}
+	f.plug("hidraw0", "", nil)
+	startup()
+
+	// Unplugged without the monitor noticing, then plugged back with the same key
+	f.mu.Lock()
+	f.plugged = nil
+	f.mu.Unlock()
+	f.plug("hidraw0", "1-3", nil)
+	InitManual(7199, "", usbRoot+"1-3")
+	initWG.Wait()
+	wantKey(t, f, "hidraw0", "7199")
+
+	if len(instances) != 2 {
+		t.Fatalf("got %d initializations, want 2", len(instances))
+	}
+	if instances[0].stopped != 1 {
+		t.Fatalf("replaced instance stopped %d times, want 1", instances[0].stopped)
+	}
+	if instances[1].stopped != 0 {
+		t.Fatalf("new instance stopped %d times, want 0", instances[1].stopped)
+	}
+	mutex.Lock()
+	got := devices["serial-7199"].Instance
+	mutex.Unlock()
+	if got != instances[1] {
+		t.Fatal("serial-7199 is not the new instance")
+	}
+}

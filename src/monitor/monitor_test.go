@@ -109,18 +109,18 @@ func TestAddInitializesAndCachesPsu(t *testing.T) {
 }
 
 func TestAddIgnoresUnsupportedDevice(t *testing.T) {
-	tests := map[string]func(msg map[string]string){
-		"during suspend": func(map[string]string) { sleep = true },
-		"other vendor":   func(msg map[string]string) { sysfs(t, "1-4", "046d", "1c1f") },
-		"excluded":       func(msg map[string]string) { sysfs(t, "1-4", "1b1c", "2a00") },
-		"usb_interface":  func(msg map[string]string) { msg["DEVTYPE"] = "usb_interface" },
+	tests := map[string]func(t *testing.T, msg map[string]string){
+		"during suspend": func(*testing.T, map[string]string) { sleep = true },
+		"other vendor":   func(t *testing.T, _ map[string]string) { sysfs(t, "1-4", "046d", "1c1f") },
+		"excluded":       func(t *testing.T, _ map[string]string) { sysfs(t, "1-4", "1b1c", "2a00") },
+		"usb_interface":  func(_ *testing.T, msg map[string]string) { msg["DEVTYPE"] = "usb_interface" },
 	}
 	for name, change := range tests {
 		t.Run(name, func(t *testing.T) {
 			f := useFakeDevices(t)
 			cache := map[string]USBInfo{}
 			msg := uevent("add", sysfs(t, "1-4", "1b1c", "1c1f"))
-			change(msg)
+			change(t, msg)
 			handleUEvent(msg, cache)
 			if len(f.inits) != 0 || len(cache) != 0 {
 				t.Fatalf("InitManual calls = %v, cache = %v, want none", f.inits, cache)

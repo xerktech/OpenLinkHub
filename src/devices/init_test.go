@@ -26,12 +26,12 @@ func useFakePSUs(t *testing.T) *fakePSUs {
 	f := &fakePSUs{ports: map[string]string{}, hold: map[string]chan struct{}{}, keys: map[string]string{}}
 	usePlainKeyPorts(t)
 
-	oldEnumerate, oldDevPath, oldNode, oldPSU := hidEnumerate, usbDevPathOf, hidNodeExists, deviceRegisterMap[7199]
+	oldEnumerate, oldDevPath, oldNode, oldPSU := hidEnumerate, usbDevPathOf, hidNodeHolds, deviceRegisterMap[7199]
 	oldDevices, oldList, oldPaths, oldInterface := devices, deviceList, usbDevPaths, interfaceId
 	devices, deviceList, usbDevPaths = map[string]*common.Device{}, map[string]Device{}, map[string]usbDevice{}
 	t.Cleanup(func() {
 		initWG.Wait()
-		hidEnumerate, usbDevPathOf, hidNodeExists, deviceRegisterMap[7199] = oldEnumerate, oldDevPath, oldNode, oldPSU
+		hidEnumerate, usbDevPathOf, hidNodeHolds, deviceRegisterMap[7199] = oldEnumerate, oldDevPath, oldNode, oldPSU
 		devices, deviceList, usbDevPaths, interfaceId = oldDevices, oldList, oldPaths, oldInterface
 	})
 
@@ -49,9 +49,12 @@ func useFakePSUs(t *testing.T) *fakePSUs {
 		}
 		return nil
 	}
-	hidNodeExists = func(path string) bool {
+	hidNodeHolds = func(path string, productId uint16) bool {
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		if productId != 7199 {
+			return false
+		}
 		for _, h := range f.plugged {
 			if "/dev/"+h == path {
 				return true

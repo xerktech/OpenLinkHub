@@ -141,6 +141,7 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -189,11 +190,46 @@ var (
 	plainKeyPortsLocation = func() string {           // file saving the ports of plainKeyPorts
 		return config.GetConfig().ConfigPath + "/database/serialless.json"
 	}
-	hidNodeExists = func(path string) bool { // whether a HID device node is still present
-		_, err := os.Stat(path)
-		return err == nil
+	hidrawClassPath = "/sys/class/hidraw" // sysfs class of HID nodes
+
+	// hidNodeHolds tells whether a HID node is present and owned by a Corsair device of given product
+	hidNodeHolds = func(path string, productId uint16) bool {
+		if _, err := os.Stat(path); err != nil {
+			return false
+		}
+		uevent, err := os.ReadFile(filepath.Join(hidrawClassPath, filepath.Base(path), "device", "uevent"))
+		if err != nil {
+			return true // Owner unknown, assume the device is still there
+		}
+		vid, pid, ok := ueventHIDID(string(uevent))
+		return !ok || (vid == vendorId && pid == productId)
 	}
 )
+
+// ueventHIDID will return the vendor and product ID from the HID_ID line of a HID device uevent,
+// e.g. HID_ID=0003:00001B1C:00001C1F
+func ueventHIDID(uevent string) (uint16, uint16, bool) {
+	for _, line := range strings.Split(uevent, "\n") {
+		id, ok := strings.CutPrefix(line, "HID_ID=")
+		if !ok {
+			continue
+		}
+		parts := strings.Split(strings.TrimSpace(id), ":")
+		if len(parts) != 3 {
+			return 0, 0, false
+		}
+		vid, err := strconv.ParseUint(parts[1], 16, 16)
+		if err != nil {
+			return 0, 0, false
+		}
+		pid, err := strconv.ParseUint(parts[2], 16, 16)
+		if err != nil {
+			return 0, 0, false
+		}
+		return uint16(vid), uint16(pid), true
+	}
+	return 0, 0, false
+}
 
 // plainKeyPorts remembers, per product ID, the USB port whose device holds the plain product ID
 // key once identical serial-less devices (e.g. two HX1500i PSUs) were seen. Without it, whichever
@@ -497,9 +533,13 @@ type usbDevice struct {
 func reserveUSBDevPath(devPath, hidPath, key string, productId uint16) {
 	mutex.Lock()
 	defer mutex.Unlock()
-	// The HID node now belongs to this device; a port-less device on it was unplugged unnoticed
-	if dev, ok := usbDevPaths[hidPath]; ok && dev.portless {
-		delete(usbDevPaths, hidPath)
+	// A port-less device on this HID node, or holding this key, was unplugged unnoticed: keyHolder
+	// only lets a device take a port-less device's key once that device is gone. Left behind, its
+	// entry shares this device's serial and a later removal of a twin would take this device.
+	for path, dev := range usbDevPaths {
+		if dev.portless && (path == hidPath || dev.key == key) {
+			delete(usbDevPaths, path)
+		}
 	}
 	if len(devPath) == 0 {
 		usbDevPaths[hidPath] = usbDevice{key: key, productId: productId, portless: true}
@@ -529,7 +569,7 @@ func trackUSBDevPath(devPath string, dev *common.Device) {
 
 // TakeSerialByDevPath will return and forget the device serial registered for a USB device path.
 // A removed device of given product whose USB port was never known is matched by its HID node
-// being gone.
+// being gone or taken by another device.
 func TakeSerialByDevPath(devPath string, productId uint16) (string, bool) {
 	mutex.Lock()
 	defer mutex.Unlock()
@@ -539,7 +579,7 @@ func TakeSerialByDevPath(devPath string, productId uint16) (string, bool) {
 		return dev.serial, len(dev.serial) > 0
 	}
 	for hidPath, d := range usbDevPaths {
-		if d.portless && d.productId == productId && len(d.serial) > 0 && !hidNodeExists(hidPath) {
+		if d.portless && d.productId == productId && len(d.serial) > 0 && !hidNodeHolds(hidPath, productId) {
 			delete(usbDevPaths, hidPath)
 			return d.serial, true
 		}
@@ -549,14 +589,15 @@ func TakeSerialByDevPath(devPath string, productId uint16) (string, bool) {
 
 // keyHolder will return the USB device path of the plugged device initialized with given key.
 // The path is empty when the holder's USB port is unknown. Such a holder whose HID node is gone,
-// or is hidPath of the device asking, was unplugged unnoticed and no longer holds the key.
+// taken by another product, or is hidPath of the device asking, was unplugged unnoticed and no
+// longer holds the key.
 func keyHolder(key, hidPath string) (string, bool) {
 	mutex.Lock()
 	defer mutex.Unlock()
 	for devPath, dev := range usbDevPaths {
 		if dev.key == key {
 			if dev.portless {
-				if devPath == hidPath || !hidNodeExists(devPath) {
+				if devPath == hidPath || !hidNodeHolds(devPath, dev.productId) {
 					continue
 				}
 				return "", true

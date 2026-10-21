@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -54,7 +55,8 @@ type USBInfo struct {
 	Serial    string
 }
 
-var sleep bool
+// sleep is set by the D-Bus PrepareForSleep goroutine and read by the netlink uevent goroutine.
+var sleep atomic.Bool
 
 // sysRoot, pause and the device calls below are variables so tests can fake sysfs, skip the
 // settle delays and observe what a uevent does to the devices without real hardware.
@@ -94,7 +96,7 @@ func Init() {
 		for signal := range ch {
 			if len(signal.Body) > 0 {
 				if isSleeping, ok := signal.Body[0].(bool); ok {
-					sleep = isSleeping
+					sleep.Store(isSleeping)
 					if isSleeping {
 						logger.Log(logger.Fields{}).Info("Suspend detected. Sending Stop() to all devices")
 
@@ -119,7 +121,7 @@ func Init() {
 						os.Exit(1)
 					}
 				} else {
-					sleep = false
+					sleep.Store(false)
 				}
 			}
 		}
@@ -196,7 +198,7 @@ func handleUEvent(msg map[string]string, cache map[string]USBInfo) {
 	switch action {
 	case "add":
 		{
-			if sleep {
+			if sleep.Load() {
 				break
 			}
 			basePath := sysRoot + devPath
@@ -228,7 +230,7 @@ func handleUEvent(msg map[string]string, cache map[string]USBInfo) {
 		break
 	case "remove":
 		{
-			if !sleep {
+			if !sleep.Load() {
 				pause(100 * time.Millisecond)
 				info, cached := cache[devPath]
 				registered, taken := "", false

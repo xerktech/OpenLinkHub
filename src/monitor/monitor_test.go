@@ -30,13 +30,14 @@ type fakeDevices struct {
 func useFakeDevices(t *testing.T) *fakeDevices {
 	t.Helper()
 	f := &fakeDevices{paths: map[string]string{}}
-	oldRoot, oldPause, oldInit, oldTake, oldStop, oldSleep := sysRoot, pause, initManual, takeSerialByDevPath, stopDirty, sleep
+	oldRoot, oldPause, oldInit, oldTake, oldStop, oldSleep := sysRoot, pause, initManual, takeSerialByDevPath, stopDirty, sleep.Load()
 	t.Cleanup(func() {
-		sysRoot, pause, initManual, takeSerialByDevPath, stopDirty, sleep = oldRoot, oldPause, oldInit, oldTake, oldStop, oldSleep
+		sysRoot, pause, initManual, takeSerialByDevPath, stopDirty = oldRoot, oldPause, oldInit, oldTake, oldStop
+		sleep.Store(oldSleep)
 	})
 
 	sysRoot = t.TempDir()
-	sleep = false
+	sleep.Store(false)
 	pause = func(time.Duration) {}
 	initManual = func(productId uint16, key, devPath string) {
 		f.inits = append(f.inits, devPath)
@@ -110,7 +111,7 @@ func TestAddInitializesAndCachesPsu(t *testing.T) {
 
 func TestAddIgnoresUnsupportedDevice(t *testing.T) {
 	tests := map[string]func(t *testing.T, msg map[string]string){
-		"during suspend": func(*testing.T, map[string]string) { sleep = true },
+		"during suspend": func(*testing.T, map[string]string) { sleep.Store(true) },
 		"other vendor":   func(t *testing.T, _ map[string]string) { sysfs(t, "1-4", "046d", "1c1f") },
 		"excluded":       func(t *testing.T, _ map[string]string) { sysfs(t, "1-4", "1b1c", "2a00") },
 		"usb_interface":  func(_ *testing.T, msg map[string]string) { msg["DEVTYPE"] = "usb_interface" },
@@ -237,8 +238,21 @@ func TestRemoveDuringSuspendIsIgnored(t *testing.T) {
 	f := useFakeDevices(t)
 	devPath := usbRoot + "1-4"
 	cache := map[string]USBInfo{devPath: {VendorID: vendorId, ProductID: 7199}}
-	sleep = true
+	sleep.Store(true)
 
 	handleUEvent(uevent("remove", devPath), cache)
 	wantStops(t, f)
+}
+
+// The suspend flag is written by the D-Bus goroutine while uevents are handled on another;
+// run with -race to catch a regression to an unsynchronized flag.
+func TestSuspendFlagSetDuringUEvent(t *testing.T) {
+	useFakeDevices(t)
+	done := make(chan struct{})
+	go func() {
+		sleep.Store(true)
+		close(done)
+	}()
+	handleUEvent(uevent("remove", usbRoot+"1-4"), map[string]USBInfo{})
+	<-done
 }

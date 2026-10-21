@@ -189,6 +189,10 @@ var (
 	plainKeyPortsLocation = func() string {           // file saving the ports of plainKeyPorts
 		return config.GetConfig().ConfigPath + "/database/serialless.json"
 	}
+	hidNodeExists = func(path string) bool { // whether a HID device node is still present
+		_, err := os.Stat(path)
+		return err == nil
+	}
 )
 
 // plainKeyPorts remembers, per product ID, the USB port whose device holds the plain product ID
@@ -480,20 +484,28 @@ func GetDevicesEx() map[string]*common.Device {
 
 // usbDevice is a registered device behind a USB device path
 type usbDevice struct {
-	serial string // Serial the device registered under
-	key    string // Key the device was initialized with
+	serial    string // Serial the device registered under
+	key       string // Key the device was initialized with
+	productId uint16 // Product ID of the device
+	portless  bool   // USB port is unknown; registered under its HID path instead
 }
 
 // reserveUSBDevPath will remember the key a device behind a USB device path is initialized with.
 // It is recorded before the device initializes, so an identical device plugged in meanwhile
-// does not take the same key.
-func reserveUSBDevPath(devPath, key string) {
+// does not take the same key. A device whose USB port can't be resolved (empty devPath) is
+// recorded under its HID path, so it still holds its key.
+func reserveUSBDevPath(devPath, hidPath, key string, productId uint16) {
+	mutex.Lock()
+	defer mutex.Unlock()
+	// The HID node now belongs to this device; a port-less device on it was unplugged unnoticed
+	if dev, ok := usbDevPaths[hidPath]; ok && dev.portless {
+		delete(usbDevPaths, hidPath)
+	}
 	if len(devPath) == 0 {
+		usbDevPaths[hidPath] = usbDevice{key: key, productId: productId, portless: true}
 		return
 	}
-	mutex.Lock()
-	usbDevPaths[devPath] = usbDevice{key: key}
-	mutex.Unlock()
+	usbDevPaths[devPath] = usbDevice{key: key, productId: productId}
 }
 
 // trackUSBDevPath will remember which registered device sits behind a USB device path.
@@ -515,23 +527,40 @@ func trackUSBDevPath(devPath string, dev *common.Device) {
 	usbDevPaths[devPath] = reserved
 }
 
-// TakeSerialByDevPath will return and forget the device serial registered for a USB device path
-func TakeSerialByDevPath(devPath string) (string, bool) {
+// TakeSerialByDevPath will return and forget the device serial registered for a USB device path.
+// A removed device of given product whose USB port was never known is matched by its HID node
+// being gone.
+func TakeSerialByDevPath(devPath string, productId uint16) (string, bool) {
 	mutex.Lock()
 	defer mutex.Unlock()
 	dev, ok := usbDevPaths[devPath]
 	if ok {
 		delete(usbDevPaths, devPath)
+		return dev.serial, len(dev.serial) > 0
 	}
-	return dev.serial, ok && len(dev.serial) > 0
+	for hidPath, d := range usbDevPaths {
+		if d.portless && d.productId == productId && len(d.serial) > 0 && !hidNodeExists(hidPath) {
+			delete(usbDevPaths, hidPath)
+			return d.serial, true
+		}
+	}
+	return "", false
 }
 
-// keyHolder will return the USB device path of the plugged device initialized with given key
-func keyHolder(key string) (string, bool) {
+// keyHolder will return the USB device path of the plugged device initialized with given key.
+// The path is empty when the holder's USB port is unknown. Such a holder whose HID node is gone,
+// or is hidPath of the device asking, was unplugged unnoticed and no longer holds the key.
+func keyHolder(key, hidPath string) (string, bool) {
 	mutex.Lock()
 	defer mutex.Unlock()
 	for devPath, dev := range usbDevPaths {
 		if dev.key == key {
+			if dev.portless {
+				if devPath == hidPath || !hidNodeExists(devPath) {
+					continue
+				}
+				return "", true
+			}
 			return devPath, true
 		}
 	}
@@ -673,7 +702,9 @@ func InitManual(productId uint16, key, devPath string) {
 			if len(key) == 0 {
 				key = info.SerialNbr
 				if len(key) == 0 {
-					key = serialLessKey(info.ProductID, devPath, info.Path, keyHolder)
+					key = serialLessKey(info.ProductID, devPath, info.Path, func(k string) (string, bool) {
+						return keyHolder(k, info.Path)
+					})
 				}
 			}
 
@@ -1075,8 +1106,12 @@ func initializeDevice(productId uint16, key, productPath string) {
 	callback, ok := deviceRegisterMap[productId]
 	if ok {
 		devPath, err := usbDevPathOf(filepath.Base(productPath))
-		if err == nil {
-			reserveUSBDevPath(devPath, key)
+		if err != nil {
+			devPath = ""
+		}
+		reserveUSBDevPath(devPath, productPath, key, productId)
+		if len(devPath) == 0 {
+			devPath = productPath // registered under its HID path
 		}
 
 		if callback.DeviceRegister != nil {

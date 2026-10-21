@@ -12,15 +12,18 @@ func TestTakeSerialByDevPath(t *testing.T) {
 	usbDevPaths[devPath] = usbDevice{serial: "abc123", key: "7199"}
 	t.Cleanup(func() { delete(usbDevPaths, devPath) })
 
-	serial, ok := TakeSerialByDevPath(devPath)
+	serial, ok := TakeSerialByDevPath(devPath, 7199)
 	if !ok || serial != "abc123" {
 		t.Fatalf("got (%q, %v), want (\"abc123\", true)", serial, ok)
 	}
 	// The mapping is consumed so a later replug on the same port registers fresh
-	if _, ok = TakeSerialByDevPath(devPath); ok {
+	if _, ok = TakeSerialByDevPath(devPath, 7199); ok {
 		t.Fatal("mapping should be removed after it is taken")
 	}
 }
+
+// holder is keyHolder asked by a device with no HID path
+func holder(key string) (string, bool) { return keyHolder(key, "") }
 
 // Two identical PSUs (e.g. two HX1500i) have no USB serial. They must get distinct keys at startup
 // and on hotplug, and a replugged PSU must get its old key back.
@@ -58,20 +61,20 @@ func TestSerialLessKeyKeepsIdenticalDevicesApart(t *testing.T) {
 	t.Cleanup(func() { delete(usbDevPaths, portA); delete(usbDevPaths, portB) })
 
 	// Hotplug: B replugged while A is still plugged must not take A's key
-	TakeSerialByDevPath(portB)
-	if k := serialLessKey(7199, portB, "", keyHolder); k != keyB {
+	TakeSerialByDevPath(portB, 7199)
+	if k := serialLessKey(7199, portB, "", holder); k != keyB {
 		t.Fatalf("B replug key = %q, want %q", k, keyB)
 	}
 	usbDevPaths[portB] = usbDevice{serial: "serialB", key: keyB}
 
 	// Hotplug: A replugged while B is still plugged gets its own key back
-	TakeSerialByDevPath(portA)
-	if k := serialLessKey(7199, portA, "", keyHolder); k != keyA {
+	TakeSerialByDevPath(portA, 7199)
+	if k := serialLessKey(7199, portA, "", holder); k != keyA {
 		t.Fatalf("A replug key = %q, want %q", k, keyA)
 	}
 
 	// Another product is not affected
-	if k := serialLessKey(7203, portA, "", keyHolder); k != "7203" {
+	if k := serialLessKey(7203, portA, "", holder); k != "7203" {
 		t.Fatalf("other product key = %q, want \"7203\"", k)
 	}
 }
@@ -84,12 +87,12 @@ func TestReserveUSBDevPath(t *testing.T) {
 	const portB = "/devices/pci0000:00/0000:00:14.0/usb1/1-3"
 	t.Cleanup(func() { delete(usbDevPaths, portA); delete(usbDevPaths, portB) })
 
-	reserveUSBDevPath(portA, "7199")
-	if k := serialLessKey(7199, portB, "", keyHolder); k != "7199-1-3" {
+	reserveUSBDevPath(portA, "/dev/hidraw9", "7199", 7199)
+	if k := serialLessKey(7199, portB, "", holder); k != "7199-1-3" {
 		t.Fatalf("key while A initializes = %q, want \"7199-1-3\"", k)
 	}
 	// Unplugged while initializing: nothing to stop yet, and the late registration is not kept
-	if _, ok := TakeSerialByDevPath(portA); ok {
+	if _, ok := TakeSerialByDevPath(portA, 7199); ok {
 		t.Fatal("device still initializing should report no serial")
 	}
 	trackUSBDevPath(portA, &common.Device{Serial: "serialA"})
@@ -98,16 +101,16 @@ func TestReserveUSBDevPath(t *testing.T) {
 	}
 
 	// Failed to initialize: the key is released
-	reserveUSBDevPath(portA, "7199")
+	reserveUSBDevPath(portA, "/dev/hidraw9", "7199", 7199)
 	trackUSBDevPath(portA, nil)
-	if _, held := keyHolder("7199"); held {
+	if _, held := keyHolder("7199", ""); held {
 		t.Fatal("key of a device that failed to initialize should be released")
 	}
 
 	// Registered: the serial is kept under the reserved key
-	reserveUSBDevPath(portB, "7199-1-3")
+	reserveUSBDevPath(portB, "/dev/hidraw9", "7199-1-3", 7199)
 	trackUSBDevPath(portB, &common.Device{Serial: "serialB"})
-	if serial, ok := TakeSerialByDevPath(portB); !ok || serial != "serialB" {
+	if serial, ok := TakeSerialByDevPath(portB, 7199); !ok || serial != "serialB" {
 		t.Fatalf("got (%q, %v), want (\"serialB\", true)", serial, ok)
 	}
 }
@@ -192,5 +195,72 @@ func TestLoadPlainKeyPorts(t *testing.T) {
 		if k := serialLessKey(7199, portB, "", func(string) (string, bool) { return portA, true }); k != "7199-1-3" {
 			t.Fatalf("file %q: B key = %q, want \"7199-1-3\"", data, k)
 		}
+	}
+}
+
+// A removed device whose USB port is unknown is matched only by its product and a gone HID node,
+// and only once it registered.
+func TestTakeSerialByDevPathPortless(t *testing.T) {
+	const usbPath = "/devices/pci0000:00/0000:00:14.0/usb1/1-9"
+	present := map[string]bool{"/dev/hidraw0": true}
+	oldNode, oldPaths := hidNodeExists, usbDevPaths
+	hidNodeExists = func(path string) bool { return present[path] }
+	usbDevPaths = map[string]usbDevice{
+		"/dev/hidraw0": {serial: "serialA", key: "7199", productId: 7199, portless: true},
+		"/dev/hidraw1": {key: "7199-hidraw1", productId: 7199, portless: true},
+	}
+	t.Cleanup(func() { hidNodeExists, usbDevPaths = oldNode, oldPaths })
+
+	if _, ok := TakeSerialByDevPath(usbPath, 7199); ok {
+		t.Fatal("took a device that is still plugged in, or one still initializing")
+	}
+	delete(present, "/dev/hidraw0")
+	if _, ok := TakeSerialByDevPath(usbPath, 7200); ok {
+		t.Fatal("took a device of another product")
+	}
+	if serial, ok := TakeSerialByDevPath(usbPath, 7199); !ok || serial != "serialA" {
+		t.Fatalf("got (%q, %v), want (\"serialA\", true)", serial, ok)
+	}
+	if _, ok := usbDevPaths["/dev/hidraw1"]; !ok {
+		t.Fatal("forgot a device still initializing")
+	}
+}
+
+// A device whose USB port is unknown holds its key only while its HID node is present.
+func TestKeyHolderPortless(t *testing.T) {
+	present := true
+	oldNode, oldPaths := hidNodeExists, usbDevPaths
+	hidNodeExists = func(string) bool { return present }
+	usbDevPaths = map[string]usbDevice{"/dev/hidraw0": {serial: "serialA", key: "7199", productId: 7199, portless: true}}
+	t.Cleanup(func() { hidNodeExists, usbDevPaths = oldNode, oldPaths })
+
+	if path, ok := keyHolder("7199", ""); !ok || path != "" {
+		t.Fatalf("got (%q, %v), want (\"\", true)", path, ok)
+	}
+	// The device asking is on the holder's node, so the holder is gone
+	if _, ok := keyHolder("7199", "/dev/hidraw0"); ok {
+		t.Fatal("a device unplugged unnoticed holds the key of the device now on its node")
+	}
+	present = false
+	if _, ok := keyHolder("7199", ""); ok {
+		t.Fatal("an unplugged device still holds its key")
+	}
+}
+
+// A device initialized on the HID node of a port-less device unplugged unnoticed takes over the
+// node, so the port-less device no longer holds its key.
+func TestReserveReplacesStalePortless(t *testing.T) {
+	const portA = "/devices/pci0000:00/0000:00:14.0/usb1/1-2"
+	oldNode, oldPaths := hidNodeExists, usbDevPaths
+	hidNodeExists = func(string) bool { return true }
+	usbDevPaths = map[string]usbDevice{"/dev/hidraw0": {serial: "serialA", key: "7199", productId: 7199, portless: true}}
+	t.Cleanup(func() { hidNodeExists, usbDevPaths = oldNode, oldPaths })
+
+	reserveUSBDevPath(portA, "/dev/hidraw0", "abc", 2000)
+	if _, ok := keyHolder("7199", ""); ok {
+		t.Fatal("a port-less device unplugged unnoticed still holds its key")
+	}
+	if path, ok := keyHolder("abc", ""); !ok || path != portA {
+		t.Fatalf("got (%q, %v), want (%q, true)", path, ok, portA)
 	}
 }

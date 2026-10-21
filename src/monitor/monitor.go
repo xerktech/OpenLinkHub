@@ -214,8 +214,12 @@ func Init() {
 				{
 					if !sleep {
 						time.Sleep(100 * time.Millisecond)
-						info, ok := cache[devPath]
-						if !ok {
+						info, cached := cache[devPath]
+						registered, taken := "", false
+						if !cached {
+							info, registered, taken = portlessUSBInfo(msg, devPath)
+						}
+						if !cached && !taken {
 							logger.Log(logger.Fields{"path": devPath}).Info("Trying to remove non-existing device")
 							continue
 						}
@@ -227,7 +231,10 @@ func Init() {
 							}
 
 							// Prefer the key the device registered under; it can differ from the USB serial
-							if registered, ok := devices.TakeSerialByDevPath(devPath); ok {
+							if !taken {
+								registered, taken = devices.TakeSerialByDevPath(devPath, info.ProductID)
+							}
+							if taken {
 								serial = registered
 							}
 							logger.Log(logger.Fields{"vendorId": info.VendorID, "productId": info.ProductID, "serial": serial}).Info("Dirty USB removal...")
@@ -244,6 +251,21 @@ func Init() {
 			time.Sleep(40 * time.Millisecond)
 		}
 	}()
+}
+
+// portlessUSBInfo will return the USB info and registered serial of a removed device that
+// registered without a known USB port. The cache built at startup has no entry under its USB path.
+func portlessUSBInfo(msg map[string]string, devPath string) (USBInfo, string, bool) {
+	ids := strings.Split(msg["PRODUCT"], "/") // vendor/product/bcdDevice in hex
+	if msg["DEVTYPE"] != "usb_device" || len(ids) < 2 {
+		return USBInfo{}, "", false
+	}
+	vid, pid := common.PidVidToUint16(ids[0]), common.PidVidToUint16(ids[1])
+	if (vid != vendorId && vid != scufVendorId) || slices.Contains(exclude, pid) {
+		return USBInfo{}, "", false
+	}
+	serial, ok := devices.TakeSerialByDevPath(devPath, pid)
+	return USBInfo{VendorID: vid, ProductID: pid}, serial, ok
 }
 
 // switchHeadsetAudioSink routes the virtual audio sink to the wired headset when it is plugged in.

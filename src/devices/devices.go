@@ -450,17 +450,63 @@ func addDevice(device *common.Device) {
 	// stay listed after an unplug already stopped them, and their StopDirty panics if repeated.
 	// Stopped in the background, so a refresh hung on the old node does not hold up this one.
 	if ok && replaced.ProductType == common.ProductTypePSUHid && replaced.Instance != nil && replaced.Instance != device.Instance {
-		if method := reflect.ValueOf(replaced.Instance).MethodByName("StopDirty"); method.IsValid() {
+		if stopInBackground(replaced.Instance) {
 			logger.Log(logger.Fields{"serial": device.Serial}).Warn("Replacing a PSU registered under the same serial")
-			initWG.Add(1)
-			go func() {
-				defer initWG.Done()
-				method.Call(nil)
-			}()
 		}
 	}
 
 	CallDeviceMethod(device.Serial, "SetDispatcher", Dispatch)
+}
+
+// stopInBackground will stop the instance of a device that was unplugged unnoticed, the way an
+// unplug would; its node is gone, so not with a full Stop. It is stopped in the background, so a
+// refresh hung on the old node holds up nothing. It returns false when the instance has no StopDirty.
+func stopInBackground(instance interface{}) bool {
+	method := reflect.ValueOf(instance).MethodByName("StopDirty")
+	if !method.IsValid() {
+		return false
+	}
+	initWG.Add(1)
+	go func() {
+		defer initWG.Done()
+		method.Call(nil)
+	}()
+	return true
+}
+
+// stopStale will stop and forget devices whose unplug was missed. Their entries were already
+// dropped from usbDevPaths and devices, so no later removal or device can reach them.
+func stopStale(stale []*common.Device) {
+	for _, device := range stale {
+		logger.Log(logger.Fields{"serial": device.Serial}).Warn("Removing a device unplugged unnoticed")
+		if config.GetConfig().EnableOpenRGBTargetServer {
+			openrgb.RemoveDeviceControllerBySerial(device.Serial)
+		}
+		if c := cluster.Get(); c != nil {
+			c.RemoveDeviceControllerBySerial(device.Serial)
+		}
+		if device.Instance != nil {
+			stopInBackground(device.Instance)
+		}
+	}
+}
+
+// forgetStale will drop the entry on path and the device registered for it, returning the device.
+// Caller holds mutex.
+func forgetStale(path string, dev usbDevice) *common.Device {
+	delete(usbDevPaths, path)
+	device, ok := devices[dev.serial]
+	if len(dev.serial) == 0 || !ok {
+		return nil
+	}
+	delete(devices, dev.serial)
+	return device
+}
+
+// stalePortless tells whether a port-less entry of given product is a registered device whose
+// HID node is gone or taken by another product, so it was unplugged. Caller holds mutex.
+func stalePortless(path string, dev usbDevice, productId uint16) bool {
+	return dev.portless && dev.productId == productId && len(dev.serial) > 0 && !hidNodeHolds(path, productId)
 }
 
 // CallDeviceMethod will call device method based on method name and arguments
@@ -548,14 +594,25 @@ type usbDevice struct {
 // does not take the same key. A device whose USB port can't be resolved (empty devPath) is
 // recorded under its HID path, so it still holds its key.
 func reserveUSBDevPath(devPath, hidPath, key string, productId uint16) {
+	var stale []*common.Device
+	defer func() { stopStale(stale) }()
 	mutex.Lock()
 	defer mutex.Unlock()
 	// A port-less device on this HID node, or holding this key, was unplugged unnoticed: keyHolder
 	// only lets a device take a port-less device's key once that device is gone. Left behind, its
 	// entry shares this device's serial and a later removal of a twin would take this device.
+	// One holding this key is replaced under the same serial, and addDevice stops it.
+	// A twin whose HID node is gone was unplugged unnoticed too (e.g. it came back on a known
+	// port, under another key). Its entry would never be taken again, but could take a twin's
+	// removal; so it is dropped and its device stopped, along with one on this HID node.
 	for path, dev := range usbDevPaths {
-		if dev.portless && (path == hidPath || dev.key == key) {
+		switch {
+		case dev.portless && dev.key == key:
 			delete(usbDevPaths, path)
+		case dev.portless && path == hidPath, stalePortless(path, dev, productId):
+			if device := forgetStale(path, dev); device != nil {
+				stale = append(stale, device)
+			}
 		}
 	}
 	if len(devPath) == 0 {
@@ -586,8 +643,11 @@ func trackUSBDevPath(devPath string, dev *common.Device) {
 
 // TakeSerialByDevPath will return and forget the device serial registered for a USB device path.
 // A removed device of given product whose USB port was never known is matched by its HID node
-// being gone or taken by another device.
+// being gone or taken by another device. When several match, all were unplugged and they can't
+// be told apart: one is returned, and the others are stopped and forgotten here.
 func TakeSerialByDevPath(devPath string, productId uint16) (string, bool) {
+	var stale []*common.Device
+	defer func() { stopStale(stale) }()
 	mutex.Lock()
 	defer mutex.Unlock()
 	dev, ok := usbDevPaths[devPath]
@@ -595,13 +655,19 @@ func TakeSerialByDevPath(devPath string, productId uint16) (string, bool) {
 		delete(usbDevPaths, devPath)
 		return dev.serial, len(dev.serial) > 0
 	}
+	serial := ""
 	for hidPath, d := range usbDevPaths {
-		if d.portless && d.productId == productId && len(d.serial) > 0 && !hidNodeHolds(hidPath, productId) {
+		if !stalePortless(hidPath, d, productId) {
+			continue
+		}
+		if len(serial) == 0 {
+			serial = d.serial
 			delete(usbDevPaths, hidPath)
-			return d.serial, true
+		} else if device := forgetStale(hidPath, d); device != nil {
+			stale = append(stale, device)
 		}
 	}
-	return "", false
+	return serial, len(serial) > 0
 }
 
 // keyHolder will return the USB device path of the plugged device initialized with given key.

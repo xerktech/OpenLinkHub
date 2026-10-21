@@ -689,7 +689,7 @@ func (d *Device) saveDeviceProfile() {
 		if d.DeviceProfile.Keyboards == nil {
 			d.DeviceProfile.Keyboards = make(map[string]*keyboards.Keyboard)
 		}
-		
+
 		needsUpgrade := len(d.DeviceProfile.Keyboards) == 0
 		for name, saved := range d.DeviceProfile.Keyboards {
 			expected := layout

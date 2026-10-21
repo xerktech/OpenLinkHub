@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	hid "github.com/sstallion/go-hid"
 )
@@ -302,4 +303,120 @@ func TestReplugPortlessPsuAfterMissedUnplug(t *testing.T) {
 	InitManual(7199, "", usbRoot+"1-3")
 	initWG.Wait()
 	wantKey(t, f, "hidraw0", "7199")
+}
+
+// stopCounter stands in for a device instance and counts how often it was stopped dirty
+type stopCounter struct{ stopped int }
+
+func (s *stopCounter) StopDirty() uint8 {
+	s.stopped++
+	return 2
+}
+
+// A PSU that replaces one registered under the same serial stops the instance it replaces.
+func TestReplugStopsReplacedInstance(t *testing.T) {
+	f := useFakePSUs(t)
+	register := deviceRegisterMap[7199]
+	var instances []*stopCounter
+	deviceRegisterMap[7199] = Product{Name: register.Name, DeviceRegister: func(vid, pid uint16, key, path string) *common.Device {
+		dev := register.DeviceRegister(vid, pid, key, path)
+		s := &stopCounter{}
+		instances = append(instances, s) // initializations run one at a time here
+		dev.Instance = s
+		return dev
+	}}
+	f.plug("hidraw0", "", nil)
+	startup()
+
+	// Unplugged without the monitor noticing, then plugged back with the same key
+	f.mu.Lock()
+	f.plugged = nil
+	f.mu.Unlock()
+	f.plug("hidraw0", "1-3", nil)
+	InitManual(7199, "", usbRoot+"1-3")
+	initWG.Wait()
+	wantKey(t, f, "hidraw0", "7199")
+
+	if len(instances) != 2 {
+		t.Fatalf("got %d initializations, want 2", len(instances))
+	}
+	if instances[0].stopped != 1 {
+		t.Fatalf("replaced instance stopped %d times, want 1", instances[0].stopped)
+	}
+	if instances[1].stopped != 0 {
+		t.Fatalf("new instance stopped %d times, want 0", instances[1].stopped)
+	}
+	mutex.Lock()
+	got := devices["serial-7199"].Instance
+	mutex.Unlock()
+	if got != instances[1] {
+		t.Fatal("serial-7199 is not the new instance")
+	}
+}
+
+// Re-adding the same instance, or replacing a device that is not a PSU, stops nothing: other
+// devices stay listed after an unplug already stopped them, and a second StopDirty panics.
+func TestAddDeviceStopsOnlyReplacedPsus(t *testing.T) {
+	useFakePSUs(t)
+	psu := &stopCounter{}
+	dev := &common.Device{ProductType: common.ProductTypePSUHid, Serial: "psu", Instance: psu}
+	addDevice(dev)
+	addDevice(&common.Device{ProductType: common.ProductTypePSUHid, Serial: "psu", Instance: psu})
+	cc := &stopCounter{}
+	addDevice(&common.Device{ProductType: common.ProductTypeCC, Serial: "cc", Instance: cc})
+	addDevice(&common.Device{ProductType: common.ProductTypeCC, Serial: "cc", Instance: &stopCounter{}})
+	initWG.Wait()
+
+	if psu.stopped != 0 {
+		t.Fatalf("re-added PSU instance stopped %d times, want 0", psu.stopped)
+	}
+	if cc.stopped != 0 {
+		t.Fatalf("replaced non-PSU instance stopped %d times, want 0", cc.stopped)
+	}
+}
+
+// blockedStop stands in for a PSU whose refresh is hung on its old node, so StopDirty waits
+type blockedStop struct{ release chan struct{} }
+
+func (b *blockedStop) StopDirty() uint8 {
+	<-b.release
+	return 2
+}
+
+// A replaced PSU stuck stopping does not hold up registering the PSU that replaced it.
+func TestReplugNotHeldUpByReplacedInstance(t *testing.T) {
+	f := useFakePSUs(t)
+	register := deviceRegisterMap[7199]
+	old := &blockedStop{release: make(chan struct{})}
+	first := true
+	deviceRegisterMap[7199] = Product{Name: register.Name, DeviceRegister: func(vid, pid uint16, key, path string) *common.Device {
+		dev := register.DeviceRegister(vid, pid, key, path)
+		if first { // initializations run one at a time here
+			first = false
+			dev.Instance = old
+		}
+		return dev
+	}}
+	f.plug("hidraw0", "", nil)
+	startup()
+
+	f.mu.Lock()
+	f.plugged = nil
+	f.mu.Unlock()
+	f.plug("hidraw0", "1-3", nil)
+	InitManual(7199, "", usbRoot+"1-3")
+	defer initWG.Wait()
+	defer close(old.release)
+
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		mutex.Lock()
+		serial := usbDevPaths[usbRoot+"1-3"].serial
+		mutex.Unlock()
+		if serial == "serial-7199" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("new PSU not registered on its port while the replaced one is stopping")
+		}
+	}
 }

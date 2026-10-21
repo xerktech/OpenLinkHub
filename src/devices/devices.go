@@ -440,8 +440,25 @@ func addDevice(device *common.Device) {
 	}
 
 	mutex.Lock()
+	replaced, ok := devices[device.Serial]
 	devices[device.Serial] = device
 	mutex.Unlock()
+
+	// A PSU whose unplug was missed can come back under the same serial (serial-less PSUs
+	// derive it from their key). Its old instance is unreachable once replaced, so stop it the
+	// way an unplug would; its node is gone, so not with a full Stop. Only PSUs: other devices
+	// stay listed after an unplug already stopped them, and their StopDirty panics if repeated.
+	// Stopped in the background, so a refresh hung on the old node does not hold up this one.
+	if ok && replaced.ProductType == common.ProductTypePSUHid && replaced.Instance != nil && replaced.Instance != device.Instance {
+		if method := reflect.ValueOf(replaced.Instance).MethodByName("StopDirty"); method.IsValid() {
+			logger.Log(logger.Fields{"serial": device.Serial}).Warn("Replacing a PSU registered under the same serial")
+			initWG.Add(1)
+			go func() {
+				defer initWG.Done()
+				method.Call(nil)
+			}()
+		}
+	}
 
 	CallDeviceMethod(device.Serial, "SetDispatcher", Dispatch)
 }

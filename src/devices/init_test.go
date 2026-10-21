@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	hid "github.com/sstallion/go-hid"
 )
@@ -371,5 +372,51 @@ func TestAddDeviceStopsOnlyReplacedPsus(t *testing.T) {
 	}
 	if cc.stopped != 0 {
 		t.Fatalf("replaced non-PSU instance stopped %d times, want 0", cc.stopped)
+	}
+}
+
+// blockedStop stands in for a PSU whose refresh is hung on its old node, so StopDirty waits
+type blockedStop struct{ release chan struct{} }
+
+func (b *blockedStop) StopDirty() uint8 {
+	<-b.release
+	return 2
+}
+
+// A replaced PSU stuck stopping does not hold up registering the PSU that replaced it.
+func TestReplugNotHeldUpByReplacedInstance(t *testing.T) {
+	f := useFakePSUs(t)
+	register := deviceRegisterMap[7199]
+	old := &blockedStop{release: make(chan struct{})}
+	first := true
+	deviceRegisterMap[7199] = Product{Name: register.Name, DeviceRegister: func(vid, pid uint16, key, path string) *common.Device {
+		dev := register.DeviceRegister(vid, pid, key, path)
+		if first { // initializations run one at a time here
+			first = false
+			dev.Instance = old
+		}
+		return dev
+	}}
+	f.plug("hidraw0", "", nil)
+	startup()
+
+	f.mu.Lock()
+	f.plugged = nil
+	f.mu.Unlock()
+	f.plug("hidraw0", "1-3", nil)
+	InitManual(7199, "", usbRoot+"1-3")
+	defer initWG.Wait()
+	defer close(old.release)
+
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		mutex.Lock()
+		serial := usbDevPaths[usbRoot+"1-3"].serial
+		mutex.Unlock()
+		if serial == "serial-7199" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("new PSU not registered on its port while the replaced one is stopping")
+		}
 	}
 }

@@ -1,11 +1,13 @@
 package monitor
 
 import (
+	"OpenLinkHub/src/logger"
 	"errors"
 	"github.com/godbus/dbus/v5"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -361,21 +363,28 @@ func TestOnlyLogindSleepSignalIsTrusted(t *testing.T) {
 	}
 }
 
-// watch will run watchSleepSignals over signals, with logind owned by each name of owners in turn.
-func watch(owners []string, signals ...*dbus.Signal) {
+// watch will run watchSleepSignals over signals, with logind owned by each name of owners in
+// turn; an empty name, or none left, fails the lookup. It returns the number of lookups.
+func watch(cacheOwner bool, owners []string, signals ...*dbus.Signal) int {
 	ch := make(chan *dbus.Signal, len(signals))
 	for _, signal := range signals {
 		ch <- signal
 	}
 	close(ch)
+	lookups := 0
 	watchSleepSignals(ch, func() (string, error) {
-		if len(owners) == 0 {
+		lookups++
+		if len(owners) == 0 || owners[0] == "" {
+			if len(owners) > 0 {
+				owners = owners[1:]
+			}
 			return "", errors.New("org.freedesktop.login1 has no owner")
 		}
 		owner := owners[0]
 		owners = owners[1:]
 		return owner, nil
-	})
+	}, cacheOwner)
+	return lookups
 }
 
 // sleepSignal will return a PrepareForSleep signal on logind's path from sender.
@@ -385,23 +394,115 @@ func sleepSignal(sender string, sleeping bool) *dbus.Signal {
 	return signal
 }
 
+// ownerChanged will return the NameOwnerChanged the bus daemon sends when logind's owner changes.
+func ownerChanged(oldOwner, newOwner string) *dbus.Signal {
+	return &dbus.Signal{Sender: busName, Path: busPath, Name: nameOwnerChangedMember, Body: []interface{}{logindName, oldOwner, newOwner}}
+}
+
+// captureWarnings will return the messages of the warnings logged while the test runs.
+func captureWarnings(t *testing.T) *[]string {
+	t.Helper()
+	var warnings []string
+	old := warn
+	t.Cleanup(func() { warn = old })
+	warn = func(_ logger.Fields, msg string) { warnings = append(warnings, msg) }
+	return &warnings
+}
+
 func TestWatchIgnoresSpoofedSleepSignals(t *testing.T) {
+	for _, cacheOwner := range []bool{true, false} {
+		f := useFakeDevices(t)
+
+		watch(cacheOwner, []string{":1.4", ":1.4"}, sleepSignal(":1.99", true), sleepSignal(":1.99", false))
+		watch(cacheOwner, nil, sleepSignal(":1.4", true), sleepSignal(":1.4", false))
+		if sleep.Load() || f.devStops+f.inStops != 0 || len(f.exits) != 0 {
+			t.Errorf("cacheOwner = %v: suspend = %v, stop calls = %d, exits = %v; want spoofs ignored", cacheOwner, sleep.Load(), f.devStops+f.inStops, f.exits)
+		}
+	}
+}
+
+func TestWatchCachesLogindOwner(t *testing.T) {
 	f := useFakeDevices(t)
 
-	watch([]string{":1.4", ":1.4"}, sleepSignal(":1.99", true), sleepSignal(":1.99", false))
-	watch(nil, sleepSignal(":1.4", true), sleepSignal(":1.4", false))
-	if sleep.Load() || f.devStops+f.inStops != 0 || len(f.exits) != 0 {
-		t.Errorf("suspend = %v, stop calls = %d, exits = %v; want spoofs ignored", sleep.Load(), f.devStops+f.inStops, f.exits)
+	// A flood of spoofs must not cost a lookup each before logind's own signal is handled
+	signals := []*dbus.Signal{}
+	for range 100 {
+		signals = append(signals, sleepSignal(":1.99", false))
+	}
+	signals = append(signals, sleepSignal(":1.4", true))
+	if lookups := watch(true, []string{":1.4"}, signals...); lookups != 1 {
+		t.Errorf("lookups = %d, want 1", lookups)
+	}
+	if f.devStops != 1 || len(f.exits) != 0 {
+		t.Errorf("devices.Stop = %d, exits = %v; want logind's suspend handled and spoofs ignored", f.devStops, f.exits)
 	}
 }
 
 func TestWatchFollowsLogindOwner(t *testing.T) {
-	f := useFakeDevices(t)
-
 	// logind restarts after the first signal and comes back under a new unique name, so a
 	// suspend from its old name must be ignored
-	watch([]string{":1.4", ":1.50", ":1.50"}, sleepSignal(":1.4", true), sleepSignal(":1.4", true), sleepSignal(":1.50", false))
-	if f.devStops != 1 || f.inStops != 1 || !slices.Equal(f.exits, []int{1}) {
-		t.Errorf("devices.Stop = %d, inputmanager.Stop = %d, exits = %v; want one stop, then exit(1) from the new owner only", f.devStops, f.inStops, f.exits)
+	t.Run("cached", func(t *testing.T) {
+		f := useFakeDevices(t)
+		lookups := watch(true, []string{":1.4", ":1.50"}, sleepSignal(":1.4", true),
+			ownerChanged(":1.4", ""), ownerChanged("", ":1.50"),
+			sleepSignal(":1.4", true), sleepSignal(":1.50", false))
+		if f.devStops != 1 || f.inStops != 1 || !slices.Equal(f.exits, []int{1}) || lookups != 2 {
+			t.Errorf("devices.Stop = %d, inputmanager.Stop = %d, exits = %v, lookups = %d; want one stop, then exit(1) from the new owner only, after 2 lookups", f.devStops, f.inStops, f.exits, lookups)
+		}
+	})
+	t.Run("looked up per signal", func(t *testing.T) {
+		f := useFakeDevices(t)
+		watch(false, []string{":1.4", ":1.50", ":1.50"}, sleepSignal(":1.4", true), sleepSignal(":1.4", true), sleepSignal(":1.50", false))
+		if f.devStops != 1 || f.inStops != 1 || !slices.Equal(f.exits, []int{1}) {
+			t.Errorf("devices.Stop = %d, inputmanager.Stop = %d, exits = %v; want one stop, then exit(1) from the new owner only", f.devStops, f.inStops, f.exits)
+		}
+	})
+}
+
+func TestWatchIgnoresSpoofedOwnerChange(t *testing.T) {
+	f := useFakeDevices(t)
+
+	// A peer claiming logind moved must neither drop the cached owner nor be trusted
+	spoof := ownerChanged(":1.4", ":1.99")
+	spoof.Sender = ":1.99"
+	other := ownerChanged("", ":1.7")
+	other.Body[0] = "org.example.Other"
+	lookups := watch(true, []string{":1.4", ":1.99"}, sleepSignal(":1.4", true), spoof, other, sleepSignal(":1.99", false))
+	if lookups != 1 || f.devStops != 1 || len(f.exits) != 0 {
+		t.Errorf("lookups = %d, devices.Stop = %d, exits = %v; want 1 lookup and the spoofed resume ignored", lookups, f.devStops, f.exits)
+	}
+}
+
+func TestWatchWarnsOncePerOutage(t *testing.T) {
+	for _, cacheOwner := range []bool{true, false} {
+		useFakeDevices(t)
+		warnings := captureWarnings(t)
+
+		// outage, recovery, outage: each outage warns once however many signals it drops
+		watch(cacheOwner, []string{"", "", ":1.4", "", ""},
+			sleepSignal(":1.4", true), sleepSignal(":1.4", true), ownerChanged("", ":1.4"),
+			sleepSignal(":1.99", true), ownerChanged(":1.4", ""),
+			sleepSignal(":1.4", true), sleepSignal(":1.4", true))
+		unresolved := 0
+		for _, msg := range *warnings {
+			if strings.HasPrefix(msg, "Unable to resolve logind") {
+				unresolved++
+			}
+		}
+		if unresolved != 2 {
+			t.Errorf("cacheOwner = %v: warnings = %q, want one per outage", cacheOwner, *warnings)
+		}
+	}
+}
+
+func TestWatchWarnsOnceForSpoofs(t *testing.T) {
+	for _, cacheOwner := range []bool{true, false} {
+		useFakeDevices(t)
+		warnings := captureWarnings(t)
+
+		watch(cacheOwner, []string{":1.4", ":1.4", ":1.4"}, sleepSignal(":1.99", true), sleepSignal(":1.98", true), sleepSignal(":1.99", false))
+		if len(*warnings) != 1 {
+			t.Errorf("cacheOwner = %v: warnings = %q, want one", cacheOwner, *warnings)
+		}
 	}
 }

@@ -26,7 +26,8 @@ type fakeDevices struct {
 	portless []string          // keys of PSUs registered without a known USB port
 	inits    []string          // USB device paths passed to devices.InitManual
 	stops    []stopped
-	stopAll  int   // devices.Stop and inputmanager.Stop calls
+	devStops int   // devices.Stop calls
+	inStops  int   // inputmanager.Stop calls
 	exits    []int // os.Exit codes
 }
 
@@ -62,8 +63,8 @@ func useFakeDevices(t *testing.T) *fakeDevices {
 	stopDirty = func(serial string, productId uint16) {
 		f.stops = append(f.stops, stopped{serial, productId})
 	}
-	stopDevices = func() { f.stopAll++ }
-	stopInputs = func() { f.stopAll++ }
+	stopDevices = func() { f.devStops++ }
+	stopInputs = func() { f.inStops++ }
 	exit = func(code int) { f.exits = append(f.exits, code) }
 	return f
 }
@@ -277,8 +278,8 @@ func TestSuspendSignalSetsFlagAndStopsDevices(t *testing.T) {
 	if !sleep.Load() {
 		t.Error("suspend flag not set")
 	}
-	if f.stopAll != 2 || len(f.exits) != 0 {
-		t.Errorf("stop calls = %d, exits = %v; want 2 stops and no exit", f.stopAll, f.exits)
+	if f.devStops != 1 || f.inStops != 1 || len(f.exits) != 0 {
+		t.Errorf("devices.Stop = %d, inputmanager.Stop = %d, exits = %v; want one of each stop and no exit", f.devStops, f.inStops, f.exits)
 	}
 
 	// A device unplugged while suspended is then left alone
@@ -295,8 +296,8 @@ func TestResumeSignalClearsFlagAndExits(t *testing.T) {
 	if sleep.Load() {
 		t.Error("suspend flag still set after resume")
 	}
-	if f.stopAll != 0 || !slices.Equal(f.exits, []int{1}) {
-		t.Errorf("stop calls = %d, exits = %v; want no stops and exit(1)", f.stopAll, f.exits)
+	if f.devStops+f.inStops != 0 || !slices.Equal(f.exits, []int{1}) {
+		t.Errorf("stop calls = %d, exits = %v; want no stops and exit(1)", f.devStops+f.inStops, f.exits)
 	}
 }
 
@@ -308,8 +309,8 @@ func TestNonBoolSleepSignalClearsFlag(t *testing.T) {
 	if sleep.Load() {
 		t.Error("suspend flag still set after a non-bool signal")
 	}
-	if f.stopAll != 0 || len(f.exits) != 0 {
-		t.Errorf("stop calls = %d, exits = %v; want neither", f.stopAll, f.exits)
+	if f.devStops+f.inStops != 0 || len(f.exits) != 0 {
+		t.Errorf("stop calls = %d, exits = %v; want neither", f.devStops+f.inStops, f.exits)
 	}
 }
 

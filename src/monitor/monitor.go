@@ -102,24 +102,11 @@ func Init() {
 		if err != nil {
 			logger.Log(logger.Fields{"error": err}).Error("Failed to add D-Bus match")
 		}
-		for signal := range ch {
-			// conn.Signal delivers every signal on the connection, whatever the match rule says,
-			// and any peer can name itself as the sender's interface. Only trust logind's unique
-			// name, looked up per signal so a restarted logind is still recognised.
-			if signal.Name != prepareForSleepMember {
-				continue
-			}
+		watchSleepSignals(ch, func() (string, error) {
 			var owner string
-			if err = conn.BusObject().Call("org.freedesktop.DBus.GetNameOwner", 0, logindName).Store(&owner); err != nil {
-				logger.Log(logger.Fields{"error": err}).Warn("Unable to resolve logind on D-Bus. Ignoring PrepareForSleep")
-				continue
-			}
-			if !fromLogind(signal, owner) {
-				logger.Log(logger.Fields{"sender": signal.Sender, "path": signal.Path}).Warn("Ignoring PrepareForSleep not sent by logind")
-				continue
-			}
-			handleSleepSignal(signal)
-		}
+			err := conn.BusObject().Call("org.freedesktop.DBus.GetNameOwner", 0, logindName).Store(&owner)
+			return owner, err
+		})
 	}()
 
 	go func() {
@@ -174,6 +161,30 @@ func Init() {
 			handleUEvent(common.ParseUEvent(buf[:n]), cache)
 		}
 	}()
+}
+
+// watchSleepSignals will handle each PrepareForSleep on ch that logind sent. owner looks up
+// logind's current unique bus name.
+func watchSleepSignals(ch <-chan *dbus.Signal, owner func() (string, error)) {
+	// conn.Signal delivers every signal on the connection, whatever the match rule says,
+	// and any peer can name itself as the sender's interface. Only trust logind's unique
+	// name, looked up per signal so a restarted logind is still recognised.
+	// Only the first rejected signal is logged, so a flood of them cannot fill the log.
+	warned := false
+	for signal := range ch {
+		if signal.Name != prepareForSleepMember {
+			continue
+		}
+		name, err := owner()
+		if err == nil && fromLogind(signal, name) {
+			handleSleepSignal(signal)
+			continue
+		}
+		if !warned {
+			warned = true
+			logger.Log(logger.Fields{"error": err, "sender": signal.Sender, "path": signal.Path}).Warn("Ignoring PrepareForSleep not sent by logind. Further ones are ignored silently")
+		}
+	}
 }
 
 // fromLogind will return true when signal is PrepareForSleep sent by logind, whose unique bus

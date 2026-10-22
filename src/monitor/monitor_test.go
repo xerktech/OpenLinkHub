@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"github.com/godbus/dbus/v5"
 	"os"
 	"path/filepath"
 	"slices"
@@ -25,14 +26,19 @@ type fakeDevices struct {
 	portless []string          // keys of PSUs registered without a known USB port
 	inits    []string          // USB device paths passed to devices.InitManual
 	stops    []stopped
+	devStops int   // devices.Stop calls
+	inStops  int   // inputmanager.Stop calls
+	exits    []int // os.Exit codes
 }
 
 func useFakeDevices(t *testing.T) *fakeDevices {
 	t.Helper()
 	f := &fakeDevices{paths: map[string]string{}}
 	oldRoot, oldPause, oldInit, oldTake, oldStop, oldSleep := sysRoot, pause, initManual, takeSerialByDevPath, stopDirty, sleep.Load()
+	oldStopDevices, oldStopInputs, oldExit := stopDevices, stopInputs, exit
 	t.Cleanup(func() {
 		sysRoot, pause, initManual, takeSerialByDevPath, stopDirty = oldRoot, oldPause, oldInit, oldTake, oldStop
+		stopDevices, stopInputs, exit = oldStopDevices, oldStopInputs, oldExit
 		sleep.Store(oldSleep)
 	})
 
@@ -57,6 +63,9 @@ func useFakeDevices(t *testing.T) *fakeDevices {
 	stopDirty = func(serial string, productId uint16) {
 		f.stops = append(f.stops, stopped{serial, productId})
 	}
+	stopDevices = func() { f.devStops++ }
+	stopInputs = func() { f.inStops++ }
+	exit = func(code int) { f.exits = append(f.exits, code) }
 	return f
 }
 
@@ -255,4 +264,62 @@ func TestSuspendFlagSetDuringUEvent(t *testing.T) {
 	}()
 	handleUEvent(uevent("remove", usbRoot+"1-4"), map[string]USBInfo{})
 	<-done
+}
+
+// prepareForSleep will return a login1 PrepareForSleep signal carrying body.
+func prepareForSleep(body ...interface{}) *dbus.Signal {
+	return &dbus.Signal{Name: "org.freedesktop.login1.Manager.PrepareForSleep", Body: body}
+}
+
+func TestSuspendSignalSetsFlagAndStopsDevices(t *testing.T) {
+	f := useFakeDevices(t)
+
+	handleSleepSignal(prepareForSleep(true))
+	if !sleep.Load() {
+		t.Error("suspend flag not set")
+	}
+	if f.devStops != 1 || f.inStops != 1 || len(f.exits) != 0 {
+		t.Errorf("devices.Stop = %d, inputmanager.Stop = %d, exits = %v; want one of each stop and no exit", f.devStops, f.inStops, f.exits)
+	}
+
+	// A device unplugged while suspended is then left alone
+	devPath := usbRoot + "1-4"
+	handleUEvent(uevent("remove", devPath), map[string]USBInfo{devPath: {VendorID: vendorId, ProductID: 7199}})
+	wantStops(t, f)
+}
+
+func TestResumeSignalClearsFlagAndExits(t *testing.T) {
+	f := useFakeDevices(t)
+	sleep.Store(true)
+
+	handleSleepSignal(prepareForSleep(false))
+	if sleep.Load() {
+		t.Error("suspend flag still set after resume")
+	}
+	if f.devStops+f.inStops != 0 || !slices.Equal(f.exits, []int{1}) {
+		t.Errorf("stop calls = %d, exits = %v; want no stops and exit(1)", f.devStops+f.inStops, f.exits)
+	}
+}
+
+func TestNonBoolSleepSignalClearsFlag(t *testing.T) {
+	f := useFakeDevices(t)
+	sleep.Store(true)
+
+	handleSleepSignal(prepareForSleep("true"))
+	if sleep.Load() {
+		t.Error("suspend flag still set after a non-bool signal")
+	}
+	if f.devStops+f.inStops != 0 || len(f.exits) != 0 {
+		t.Errorf("stop calls = %d, exits = %v; want neither", f.devStops+f.inStops, f.exits)
+	}
+}
+
+func TestEmptySleepSignalKeepsFlag(t *testing.T) {
+	useFakeDevices(t)
+	sleep.Store(true)
+
+	handleSleepSignal(prepareForSleep())
+	if !sleep.Load() {
+		t.Error("suspend flag cleared by a signal with no body")
+	}
 }

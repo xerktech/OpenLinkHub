@@ -66,6 +66,9 @@ var (
 	initManual          = devices.InitManual
 	takeSerialByDevPath = devices.TakeSerialByDevPath
 	stopDirty           = devices.StopDirty
+	stopDevices         = devices.Stop
+	stopInputs          = inputmanager.Stop
+	exit                = os.Exit
 )
 
 func Init() {
@@ -94,36 +97,7 @@ func Init() {
 			logger.Log(logger.Fields{"error": err}).Error("Failed to add D-Bus match")
 		}
 		for signal := range ch {
-			if len(signal.Body) > 0 {
-				if isSleeping, ok := signal.Body[0].(bool); ok {
-					sleep.Store(isSleeping)
-					if isSleeping {
-						logger.Log(logger.Fields{}).Info("Suspend detected. Sending Stop() to all devices")
-
-						// Cleanup
-						if config.GetConfig().EnableOpenRGBTargetServer {
-							openrgb.Close()
-							openrgb.ClearDeviceControllers()
-						}
-
-						// Stop
-						devices.Stop()
-						inputmanager.Stop()
-					} else {
-						time.Sleep(time.Duration(config.GetConfig().ResumeDelay) * time.Millisecond)
-						logger.Log(logger.Fields{}).Info("Resume detected. Process is shutting down...")
-
-						// Due to the issues encountered when sleeping and resuming, this is the best way to handle
-						// the resume, as systemd will pick up non-zero exit codes and restart on failure.
-						// If you're reading this and thinking a resume should work, good luck.
-						// Enough time was spent on tweaking this and trying to do something that makes no sense;
-						// just terminate the process and let systemd do the magic.
-						os.Exit(1)
-					}
-				} else {
-					sleep.Store(false)
-				}
-			}
+			handleSleepSignal(signal)
 		}
 	}()
 
@@ -179,6 +153,43 @@ func Init() {
 			handleUEvent(common.ParseUEvent(buf[:n]), cache)
 		}
 	}()
+}
+
+// handleSleepSignal will stop all devices when a PrepareForSleep signal reports a suspend,
+// and exit the process when it reports a resume.
+func handleSleepSignal(signal *dbus.Signal) {
+	if len(signal.Body) == 0 {
+		return
+	}
+	isSleeping, ok := signal.Body[0].(bool)
+	if !ok {
+		sleep.Store(false)
+		return
+	}
+	sleep.Store(isSleeping)
+	if isSleeping {
+		logger.Log(logger.Fields{}).Info("Suspend detected. Sending Stop() to all devices")
+
+		// Cleanup
+		if config.GetConfig().EnableOpenRGBTargetServer {
+			openrgb.Close()
+			openrgb.ClearDeviceControllers()
+		}
+
+		// Stop
+		stopDevices()
+		stopInputs()
+	} else {
+		pause(time.Duration(config.GetConfig().ResumeDelay) * time.Millisecond)
+		logger.Log(logger.Fields{}).Info("Resume detected. Process is shutting down...")
+
+		// Due to the issues encountered when sleeping and resuming, this is the best way to handle
+		// the resume, as systemd will pick up non-zero exit codes and restart on failure.
+		// If you're reading this and thinking a resume should work, good luck.
+		// Enough time was spent on tweaking this and trying to do something that makes no sense;
+		// just terminate the process and let systemd do the magic.
+		exit(1)
+	}
 }
 
 // handleUEvent will add or remove the Corsair or Scuf USB device a kernel uevent reports.

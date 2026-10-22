@@ -53,6 +53,13 @@ const (
 	prepareForSleepMember = "org.freedesktop.login1.Manager.PrepareForSleep"
 )
 
+// The bus daemon reports a change of logind's owner with NameOwnerChanged; peers cannot send as it
+const (
+	busName                = "org.freedesktop.DBus"
+	busPath                = dbus.ObjectPath("/org/freedesktop/DBus")
+	nameOwnerChangedMember = "org.freedesktop.DBus.NameOwnerChanged"
+)
+
 // longSleep list of devices that require 5+ seconds to finish booting up
 var longSleep = []uint16{7165, 7033}
 
@@ -76,6 +83,7 @@ var (
 	stopDevices         = devices.Stop
 	stopInputs          = inputmanager.Stop
 	exit                = os.Exit
+	warn                = func(fields logger.Fields, msg string) { logger.Log(fields).Warn(msg) }
 )
 
 func Init() {
@@ -102,11 +110,18 @@ func Init() {
 		if err != nil {
 			logger.Log(logger.Fields{"error": err}).Error("Failed to add D-Bus match")
 		}
+
+		// Follow logind's owner so it is looked up once, not once per PrepareForSleep
+		match = "type='signal',sender='" + busName + "',path='" + string(busPath) + "',interface='" + busName + "',member='NameOwnerChanged',arg0='" + logindName + "'"
+		err = conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, match).Store()
+		if err != nil {
+			logger.Log(logger.Fields{"error": err}).Error("Failed to add D-Bus match. logind is looked up per PrepareForSleep")
+		}
 		watchSleepSignals(ch, func() (string, error) {
 			var owner string
 			err := conn.BusObject().Call("org.freedesktop.DBus.GetNameOwner", 0, logindName).Store(&owner)
 			return owner, err
-		})
+		}, err == nil)
 	}()
 
 	go func() {
@@ -164,35 +179,56 @@ func Init() {
 }
 
 // watchSleepSignals will handle each PrepareForSleep on ch that logind sent. owner looks up
-// logind's current unique bus name.
-func watchSleepSignals(ch <-chan *dbus.Signal, owner func() (string, error)) {
+// logind's current unique bus name. When cacheOwner is set, the name is cached until a
+// NameOwnerChanged for logind arrives on ch; otherwise it is looked up per signal.
+func watchSleepSignals(ch <-chan *dbus.Signal, owner func() (string, error), cacheOwner bool) {
 	// conn.Signal delivers every signal on the connection, whatever the match rule says,
 	// and any peer can name itself as the sender's interface. Only trust logind's unique
-	// name, looked up per signal so a restarted logind is still recognised.
+	// name, so a restarted logind is still recognised once its owner is looked up again.
+	// Caching it keeps a flood of spoofs from costing a bus round trip each.
 	// Spoofs are logged once, and each logind outage once, so a flood cannot fill the log.
 	warnedSpoof, warnedLookup := false, false
+	name, known := "", false
 	for signal := range ch {
+		if logindOwnerChanged(signal) {
+			known = false
+			continue
+		}
 		if signal.Name != prepareForSleepMember {
 			continue
 		}
-		name, err := owner()
-		if err != nil {
-			if !warnedLookup {
-				warnedLookup = true
-				logger.Log(logger.Fields{"error": err, "sender": signal.Sender}).Warn("Unable to resolve logind on D-Bus. Ignoring PrepareForSleep")
+		if !known {
+			var err error
+			name, err = owner()
+			if err != nil {
+				if !warnedLookup {
+					warnedLookup = true
+					warn(logger.Fields{"error": err, "sender": signal.Sender}, "Unable to resolve logind on D-Bus. Ignoring PrepareForSleep")
+				}
+				continue
 			}
-			continue
+			warnedLookup = false
+			known = cacheOwner
 		}
-		warnedLookup = false
 		if !fromLogind(signal, name) {
 			if !warnedSpoof {
 				warnedSpoof = true
-				logger.Log(logger.Fields{"sender": signal.Sender, "path": signal.Path}).Warn("Ignoring PrepareForSleep not sent by logind. Further ones are ignored silently")
+				warn(logger.Fields{"sender": signal.Sender, "path": signal.Path}, "Ignoring PrepareForSleep not sent by logind. Further ones are ignored silently")
 			}
 			continue
 		}
 		handleSleepSignal(signal)
 	}
+}
+
+// logindOwnerChanged will return true when signal is the bus daemon reporting that logind's
+// unique bus name changed.
+func logindOwnerChanged(signal *dbus.Signal) bool {
+	if signal.Sender != busName || signal.Path != busPath || signal.Name != nameOwnerChangedMember || len(signal.Body) == 0 {
+		return false
+	}
+	name, ok := signal.Body[0].(string)
+	return ok && name == logindName
 }
 
 // fromLogind will return true when signal is PrepareForSleep sent by logind, whose unique bus

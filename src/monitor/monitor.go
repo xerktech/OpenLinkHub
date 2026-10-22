@@ -88,8 +88,10 @@ var (
 
 func Init() {
 	go func() {
-		// Connect to the session bus
-		conn, err := dbus.ConnectSystemBus()
+		// Connect to the system bus. The default signal handler stops keeping signals in order
+		// once ch is full, and the cached logind owner relies on NameOwnerChanged arriving before
+		// the new owner's PrepareForSleep
+		conn, err := dbus.ConnectSystemBus(dbus.WithSignalHandler(dbus.NewSequentialSignalHandler()))
 		if err != nil {
 			logger.Log(logger.Fields{"error": err}).Error("Failed to connect to system bus")
 			return

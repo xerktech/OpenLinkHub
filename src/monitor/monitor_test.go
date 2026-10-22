@@ -323,3 +323,39 @@ func TestEmptySleepSignalKeepsFlag(t *testing.T) {
 		t.Error("suspend flag cleared by a signal with no body")
 	}
 }
+
+func TestOnlyLogindSleepSignalIsTrusted(t *testing.T) {
+	const owner = ":1.4"
+	logind := func() *dbus.Signal {
+		signal := prepareForSleep(true)
+		signal.Sender, signal.Path = owner, logindPath
+		return signal
+	}
+	if !fromLogind(logind(), owner) {
+		t.Error("PrepareForSleep from logind rejected")
+	}
+
+	for name, change := range map[string]func(*dbus.Signal){
+		"another peer":      func(s *dbus.Signal) { s.Sender = ":1.99" },
+		"well-known sender": func(s *dbus.Signal) { s.Sender = logindName },
+		"no sender":         func(s *dbus.Signal) { s.Sender = "" },
+		"another path":      func(s *dbus.Signal) { s.Path = "/org/freedesktop/login1/session/self" },
+		"another member":    func(s *dbus.Signal) { s.Name = "org.freedesktop.login1.Manager.PrepareForShutdown" },
+		"another interface": func(s *dbus.Signal) { s.Name = "org.example.Manager.PrepareForSleep" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			signal := logind()
+			change(signal)
+			if fromLogind(signal, owner) {
+				t.Errorf("signal %+v trusted", signal)
+			}
+		})
+	}
+
+	// No logind on the bus: an empty owner must not match an empty sender
+	signal := logind()
+	signal.Sender = ""
+	if fromLogind(signal, "") {
+		t.Error("signal trusted with logind absent")
+	}
+}

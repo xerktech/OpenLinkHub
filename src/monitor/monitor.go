@@ -46,6 +46,13 @@ var pipewireNodeNames = map[uint16]string{
 	2660: "Wireless Gaming Receiver",
 }
 
+// logind is the service that sends PrepareForSleep; any other sender must be ignored
+const (
+	logindName            = "org.freedesktop.login1"
+	logindPath            = dbus.ObjectPath("/org/freedesktop/login1")
+	prepareForSleepMember = "org.freedesktop.login1.Manager.PrepareForSleep"
+)
+
 // longSleep list of devices that require 5+ seconds to finish booting up
 var longSleep = []uint16{7165, 7033}
 
@@ -87,16 +94,30 @@ func Init() {
 		}(conn)
 
 		// Listen for the PrepareForSleep signal
-		_ = conn.Object("org.freedesktop.login1", "/org/freedesktop/login1")
 		ch := make(chan *dbus.Signal, 10)
 		conn.Signal(ch)
 
-		match := "type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'"
+		match := "type='signal',sender='" + logindName + "',path='" + string(logindPath) + "',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'"
 		err = conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, match).Store()
 		if err != nil {
 			logger.Log(logger.Fields{"error": err}).Error("Failed to add D-Bus match")
 		}
 		for signal := range ch {
+			// conn.Signal delivers every signal on the connection, whatever the match rule says,
+			// and any peer can name itself as the sender's interface. Only trust logind's unique
+			// name, looked up per signal so a restarted logind is still recognised.
+			if signal.Name != prepareForSleepMember {
+				continue
+			}
+			var owner string
+			if err = conn.BusObject().Call("org.freedesktop.DBus.GetNameOwner", 0, logindName).Store(&owner); err != nil {
+				logger.Log(logger.Fields{"error": err}).Warn("Unable to resolve logind on D-Bus. Ignoring PrepareForSleep")
+				continue
+			}
+			if !fromLogind(signal, owner) {
+				logger.Log(logger.Fields{"sender": signal.Sender, "path": signal.Path}).Warn("Ignoring PrepareForSleep not sent by logind")
+				continue
+			}
 			handleSleepSignal(signal)
 		}
 	}()
@@ -153,6 +174,12 @@ func Init() {
 			handleUEvent(common.ParseUEvent(buf[:n]), cache)
 		}
 	}()
+}
+
+// fromLogind will return true when signal is PrepareForSleep sent by logind, whose unique bus
+// name is owner.
+func fromLogind(signal *dbus.Signal, owner string) bool {
+	return owner != "" && signal.Sender == owner && signal.Path == logindPath && signal.Name == prepareForSleepMember
 }
 
 // handleSleepSignal will stop all devices when a PrepareForSleep signal reports a suspend,

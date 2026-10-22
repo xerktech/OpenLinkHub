@@ -169,21 +169,29 @@ func watchSleepSignals(ch <-chan *dbus.Signal, owner func() (string, error)) {
 	// conn.Signal delivers every signal on the connection, whatever the match rule says,
 	// and any peer can name itself as the sender's interface. Only trust logind's unique
 	// name, looked up per signal so a restarted logind is still recognised.
-	// Only the first rejected signal is logged, so a flood of them cannot fill the log.
-	warned := false
+	// Spoofs are logged once, and each logind outage once, so a flood cannot fill the log.
+	warnedSpoof, warnedLookup := false, false
 	for signal := range ch {
 		if signal.Name != prepareForSleepMember {
 			continue
 		}
 		name, err := owner()
-		if err == nil && fromLogind(signal, name) {
-			handleSleepSignal(signal)
+		if err != nil {
+			if !warnedLookup {
+				warnedLookup = true
+				logger.Log(logger.Fields{"error": err, "sender": signal.Sender}).Warn("Unable to resolve logind on D-Bus. Ignoring PrepareForSleep")
+			}
 			continue
 		}
-		if !warned {
-			warned = true
-			logger.Log(logger.Fields{"error": err, "sender": signal.Sender, "path": signal.Path}).Warn("Ignoring PrepareForSleep not sent by logind. Further ones are ignored silently")
+		warnedLookup = false
+		if !fromLogind(signal, name) {
+			if !warnedSpoof {
+				warnedSpoof = true
+				logger.Log(logger.Fields{"sender": signal.Sender, "path": signal.Path}).Warn("Ignoring PrepareForSleep not sent by logind. Further ones are ignored silently")
+			}
+			continue
 		}
+		handleSleepSignal(signal)
 	}
 }
 

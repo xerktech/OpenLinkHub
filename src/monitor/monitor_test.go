@@ -398,8 +398,9 @@ func TestWatchIgnoresSpoofedSleepSignals(t *testing.T) {
 func TestWatchFollowsLogindOwner(t *testing.T) {
 	f := useFakeDevices(t)
 
-	// logind restarts between the signals and comes back under a new unique name
-	watch([]string{":1.4", ":1.50", ":1.50"}, sleepSignal(":1.4", true), sleepSignal(":1.4", false), sleepSignal(":1.50", false))
+	// logind restarts after the first signal and comes back under a new unique name, so a
+	// suspend from its old name must be ignored
+	watch([]string{":1.4", ":1.50", ":1.50"}, sleepSignal(":1.4", true), sleepSignal(":1.4", true), sleepSignal(":1.50", false))
 	if f.devStops != 1 || f.inStops != 1 || !slices.Equal(f.exits, []int{1}) {
 		t.Errorf("devices.Stop = %d, inputmanager.Stop = %d, exits = %v; want one stop, then exit(1) from the new owner only", f.devStops, f.inStops, f.exits)
 	}

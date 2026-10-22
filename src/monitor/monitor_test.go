@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"errors"
 	"github.com/godbus/dbus/v5"
 	"os"
 	"path/filepath"
@@ -321,5 +322,86 @@ func TestEmptySleepSignalKeepsFlag(t *testing.T) {
 	handleSleepSignal(prepareForSleep())
 	if !sleep.Load() {
 		t.Error("suspend flag cleared by a signal with no body")
+	}
+}
+
+func TestOnlyLogindSleepSignalIsTrusted(t *testing.T) {
+	const owner = ":1.4"
+	logind := func() *dbus.Signal {
+		signal := prepareForSleep(true)
+		signal.Sender, signal.Path = owner, logindPath
+		return signal
+	}
+	if !fromLogind(logind(), owner) {
+		t.Error("PrepareForSleep from logind rejected")
+	}
+
+	for name, change := range map[string]func(*dbus.Signal){
+		"another peer":      func(s *dbus.Signal) { s.Sender = ":1.99" },
+		"well-known sender": func(s *dbus.Signal) { s.Sender = logindName },
+		"no sender":         func(s *dbus.Signal) { s.Sender = "" },
+		"another path":      func(s *dbus.Signal) { s.Path = "/org/freedesktop/login1/session/self" },
+		"another member":    func(s *dbus.Signal) { s.Name = "org.freedesktop.login1.Manager.PrepareForShutdown" },
+		"another interface": func(s *dbus.Signal) { s.Name = "org.example.Manager.PrepareForSleep" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			signal := logind()
+			change(signal)
+			if fromLogind(signal, owner) {
+				t.Errorf("signal %+v trusted", signal)
+			}
+		})
+	}
+
+	// No logind on the bus: an empty owner must not match an empty sender
+	signal := logind()
+	signal.Sender = ""
+	if fromLogind(signal, "") {
+		t.Error("signal trusted with logind absent")
+	}
+}
+
+// watch will run watchSleepSignals over signals, with logind owned by each name of owners in turn.
+func watch(owners []string, signals ...*dbus.Signal) {
+	ch := make(chan *dbus.Signal, len(signals))
+	for _, signal := range signals {
+		ch <- signal
+	}
+	close(ch)
+	watchSleepSignals(ch, func() (string, error) {
+		if len(owners) == 0 {
+			return "", errors.New("org.freedesktop.login1 has no owner")
+		}
+		owner := owners[0]
+		owners = owners[1:]
+		return owner, nil
+	})
+}
+
+// sleepSignal will return a PrepareForSleep signal on logind's path from sender.
+func sleepSignal(sender string, sleeping bool) *dbus.Signal {
+	signal := prepareForSleep(sleeping)
+	signal.Sender, signal.Path = sender, logindPath
+	return signal
+}
+
+func TestWatchIgnoresSpoofedSleepSignals(t *testing.T) {
+	f := useFakeDevices(t)
+
+	watch([]string{":1.4", ":1.4"}, sleepSignal(":1.99", true), sleepSignal(":1.99", false))
+	watch(nil, sleepSignal(":1.4", true), sleepSignal(":1.4", false))
+	if sleep.Load() || f.devStops+f.inStops != 0 || len(f.exits) != 0 {
+		t.Errorf("suspend = %v, stop calls = %d, exits = %v; want spoofs ignored", sleep.Load(), f.devStops+f.inStops, f.exits)
+	}
+}
+
+func TestWatchFollowsLogindOwner(t *testing.T) {
+	f := useFakeDevices(t)
+
+	// logind restarts after the first signal and comes back under a new unique name, so a
+	// suspend from its old name must be ignored
+	watch([]string{":1.4", ":1.50", ":1.50"}, sleepSignal(":1.4", true), sleepSignal(":1.4", true), sleepSignal(":1.50", false))
+	if f.devStops != 1 || f.inStops != 1 || !slices.Equal(f.exits, []int{1}) {
+		t.Errorf("devices.Stop = %d, inputmanager.Stop = %d, exits = %v; want one stop, then exit(1) from the new owner only", f.devStops, f.inStops, f.exits)
 	}
 }

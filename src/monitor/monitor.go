@@ -105,10 +105,8 @@ func Init() {
 
 		listenForSleep(conn.Signal, func(rule string) error {
 			return conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, rule).Store()
-		}, func() (string, error) {
-			var owner string
-			err := conn.BusObject().Call("org.freedesktop.DBus.GetNameOwner", 0, logindName).Store(&owner)
-			return owner, err
+		}, func() (string, dbus.Sequence, error) {
+			return lookupLogind(conn.BusObject())
 		})
 	}()
 
@@ -168,13 +166,23 @@ func Init() {
 
 // listenForSleep will register for signals through subscribe, add the sleep match rules through
 // addMatch and handle PrepareForSleep until the signal channel closes. owner looks up logind's
-// unique bus name. The bus calls are passed in so tests can run it without a bus.
-func listenForSleep(subscribe func(chan<- *dbus.Signal), addMatch func(rule string) error, owner func() (string, error)) {
+// unique bus name, as watchSleepSignals describes. The bus calls are passed in so tests can run
+// it without a bus.
+func listenForSleep(subscribe func(chan<- *dbus.Signal), addMatch func(rule string) error, owner func() (string, dbus.Sequence, error)) {
 	// Listen for the PrepareForSleep signal
 	ch := make(chan *dbus.Signal, 10)
 	subscribe(ch)
 
 	watchSleepSignals(ch, owner, addSleepMatches(addMatch))
+}
+
+// lookupLogind will ask bus for logind's unique bus name, and return it with the sequence of
+// the reply that carried it.
+func lookupLogind(bus dbus.BusObject) (string, dbus.Sequence, error) {
+	var owner string
+	call := bus.Call("org.freedesktop.DBus.GetNameOwner", 0, logindName)
+	err := call.Store(&owner)
+	return owner, call.ResponseSequence, err
 }
 
 // addSleepMatches will ask the bus, through addMatch, for logind's PrepareForSleep and for
@@ -196,9 +204,12 @@ func addSleepMatches(addMatch func(rule string) error) bool {
 }
 
 // watchSleepSignals will handle each PrepareForSleep on ch that logind sent. owner looks up
-// logind's current unique bus name. When cacheOwner is set, the name is cached until a
-// NameOwnerChanged for logind arrives on ch; otherwise it is looked up per signal.
-func watchSleepSignals(ch <-chan *dbus.Signal, owner func() (string, error), cacheOwner bool) {
+// logind's current unique bus name and the sequence of the reply that carried it. When
+// cacheOwner is set, the name is cached until a NameOwnerChanged for logind arrives on ch.
+// Otherwise it is trusted only for signals received before that reply: the bus routed them
+// before answering, so each is judged by logind's owner at some point after it was sent, as a
+// lookup per signal would. A queued flood then costs one lookup, not one per spoof.
+func watchSleepSignals(ch <-chan *dbus.Signal, owner func() (string, dbus.Sequence, error), cacheOwner bool) {
 	// conn.Signal delivers every signal on the connection, whatever the match rule says,
 	// and any peer can name itself as the sender's interface. Only trust logind's unique
 	// name, so a restarted logind is still recognised once its owner is looked up again.
@@ -206,6 +217,7 @@ func watchSleepSignals(ch <-chan *dbus.Signal, owner func() (string, error), cac
 	// Spoofs are logged once, and each logind outage once, so a flood cannot fill the log.
 	warnedSpoof, warnedLookup := false, false
 	name, known := "", false
+	var answered dbus.Sequence
 	for signal := range ch {
 		if logindOwnerChanged(signal) {
 			known = false
@@ -214,9 +226,12 @@ func watchSleepSignals(ch <-chan *dbus.Signal, owner func() (string, error), cac
 		if signal.Name != prepareForSleepMember {
 			continue
 		}
+		if known && !cacheOwner && signal.Sequence >= answered {
+			known = false
+		}
 		if !known {
 			var err error
-			name, err = owner()
+			name, answered, err = owner()
 			if err != nil {
 				if !warnedLookup {
 					warnedLookup = true
@@ -225,7 +240,7 @@ func watchSleepSignals(ch <-chan *dbus.Signal, owner func() (string, error), cac
 				continue
 			}
 			warnedLookup = false
-			known = cacheOwner
+			known = true
 		}
 		if !fromLogind(signal, name) {
 			if !warnedSpoof {

@@ -533,6 +533,10 @@ func TestListenCachesOwnerOnlyWhenOwnerChangesAreMatched(t *testing.T) {
 		useFakeDevices(t)
 		matches, lookups := 0, 0
 		listenForSleep(func(ch chan<- *dbus.Signal) {
+			// Subscribing after the matches could drop a signal the bus routes in between
+			if matches != 0 {
+				t.Errorf("AddMatch %d refused: subscribed after %d matches, want before any", refused, matches)
+			}
 			ch <- sleepSignal(":1.4", true)
 			ch <- sleepSignal(":1.4", true)
 			close(ch)

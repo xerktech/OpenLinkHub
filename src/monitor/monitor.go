@@ -107,23 +107,14 @@ func Init() {
 		ch := make(chan *dbus.Signal, 10)
 		conn.Signal(ch)
 
-		match := "type='signal',sender='" + logindName + "',path='" + string(logindPath) + "',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'"
-		err = conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, match).Store()
-		if err != nil {
-			logger.Log(logger.Fields{"error": err}).Error("Failed to add D-Bus match")
-		}
-
-		// Follow logind's owner so it is looked up once, not once per PrepareForSleep
-		match = "type='signal',sender='" + busName + "',path='" + string(busPath) + "',interface='" + busName + "',member='NameOwnerChanged',arg0='" + logindName + "'"
-		err = conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, match).Store()
-		if err != nil {
-			logger.Log(logger.Fields{"error": err}).Error("Failed to add D-Bus match. logind is looked up per PrepareForSleep")
-		}
+		cacheOwner := addSleepMatches(func(rule string) error {
+			return conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, rule).Store()
+		})
 		watchSleepSignals(ch, func() (string, error) {
 			var owner string
 			err := conn.BusObject().Call("org.freedesktop.DBus.GetNameOwner", 0, logindName).Store(&owner)
 			return owner, err
-		}, err == nil)
+		}, cacheOwner)
 	}()
 
 	go func() {
@@ -178,6 +169,24 @@ func Init() {
 			handleUEvent(common.ParseUEvent(buf[:n]), cache)
 		}
 	}()
+}
+
+// addSleepMatches will ask the bus, through addMatch, for logind's PrepareForSleep and for
+// changes of logind's owner. It returns whether logind's owner can be cached: only when owner
+// changes are delivered, otherwise a restarted or replaced logind would never be recognised.
+func addSleepMatches(addMatch func(rule string) error) bool {
+	match := "type='signal',sender='" + logindName + "',path='" + string(logindPath) + "',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'"
+	if err := addMatch(match); err != nil {
+		logger.Log(logger.Fields{"error": err}).Error("Failed to add D-Bus match")
+	}
+
+	// Follow logind's owner so it is looked up once, not once per PrepareForSleep
+	match = "type='signal',sender='" + busName + "',path='" + string(busPath) + "',interface='" + busName + "',member='NameOwnerChanged',arg0='" + logindName + "'"
+	if err := addMatch(match); err != nil {
+		logger.Log(logger.Fields{"error": err}).Error("Failed to add D-Bus match. logind is looked up per PrepareForSleep")
+		return false
+	}
+	return true
 }
 
 // watchSleepSignals will handle each PrepareForSleep on ch that logind sent. owner looks up

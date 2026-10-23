@@ -506,3 +506,23 @@ func TestWatchWarnsOnceForSpoofs(t *testing.T) {
 		}
 	}
 }
+
+func TestOwnerCachedOnlyWhenOwnerChangesAreMatched(t *testing.T) {
+	// The bus refuses the n-th AddMatch (0 for none), as one capping match rules per connection does
+	for refused, want := range []bool{true, true, false} {
+		var rules []string
+		got := addSleepMatches(func(rule string) error {
+			rules = append(rules, rule)
+			if len(rules) == refused {
+				return errors.New("org.freedesktop.DBus.Error.LimitsExceeded")
+			}
+			return nil
+		})
+		if got != want {
+			t.Errorf("AddMatch %d refused: cacheOwner = %v, want %v", refused, got, want)
+		}
+		if len(rules) != 2 || !strings.Contains(rules[0], "member='PrepareForSleep'") || !strings.Contains(rules[1], "member='NameOwnerChanged',arg0='"+logindName+"'") {
+			t.Errorf("AddMatch %d refused: rules = %q, want PrepareForSleep then logind's NameOwnerChanged", refused, rules)
+		}
+	}
+}

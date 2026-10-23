@@ -526,3 +526,27 @@ func TestOwnerCachedOnlyWhenOwnerChangesAreMatched(t *testing.T) {
 		}
 	}
 }
+
+func TestListenCachesOwnerOnlyWhenOwnerChangesAreMatched(t *testing.T) {
+	// Two suspends from logind: cached, its owner is looked up once; otherwise once per signal
+	for refused, want := range map[int]int{0: 1, 1: 1, 2: 2} {
+		useFakeDevices(t)
+		matches, lookups := 0, 0
+		listenForSleep(func(ch chan<- *dbus.Signal) {
+			ch <- sleepSignal(":1.4", true)
+			ch <- sleepSignal(":1.4", true)
+			close(ch)
+		}, func(string) error {
+			if matches++; matches == refused {
+				return errors.New("org.freedesktop.DBus.Error.LimitsExceeded")
+			}
+			return nil
+		}, func() (string, error) {
+			lookups++
+			return ":1.4", nil
+		})
+		if lookups != want {
+			t.Errorf("AddMatch %d refused: lookups = %d, want %d", refused, lookups, want)
+		}
+	}
+}

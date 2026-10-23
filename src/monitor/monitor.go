@@ -103,18 +103,13 @@ func Init() {
 			}
 		}(conn)
 
-		// Listen for the PrepareForSleep signal
-		ch := make(chan *dbus.Signal, 10)
-		conn.Signal(ch)
-
-		cacheOwner := addSleepMatches(func(rule string) error {
+		listenForSleep(conn.Signal, func(rule string) error {
 			return conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, rule).Store()
-		})
-		watchSleepSignals(ch, func() (string, error) {
+		}, func() (string, error) {
 			var owner string
 			err := conn.BusObject().Call("org.freedesktop.DBus.GetNameOwner", 0, logindName).Store(&owner)
 			return owner, err
-		}, cacheOwner)
+		})
 	}()
 
 	go func() {
@@ -169,6 +164,17 @@ func Init() {
 			handleUEvent(common.ParseUEvent(buf[:n]), cache)
 		}
 	}()
+}
+
+// listenForSleep will register for signals through subscribe, add the sleep match rules through
+// addMatch and handle PrepareForSleep until the signal channel closes. owner looks up logind's
+// unique bus name. The bus calls are passed in so tests can run it without a bus.
+func listenForSleep(subscribe func(chan<- *dbus.Signal), addMatch func(rule string) error, owner func() (string, error)) {
+	// Listen for the PrepareForSleep signal
+	ch := make(chan *dbus.Signal, 10)
+	subscribe(ch)
+
+	watchSleepSignals(ch, owner, addSleepMatches(addMatch))
 }
 
 // addSleepMatches will ask the bus, through addMatch, for logind's PrepareForSleep and for

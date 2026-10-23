@@ -365,24 +365,34 @@ func TestOnlyLogindSleepSignalIsTrusted(t *testing.T) {
 
 // watch will run watchSleepSignals over signals, with logind owned by each name of owners in
 // turn; an empty name, or none left, fails the lookup. It returns the number of lookups.
+// Each lookup is answered after every signal, so an owner that is not cached is looked up per signal.
 func watch(cacheOwner bool, owners []string, signals ...*dbus.Signal) int {
+	return watchAnswered(dbus.NoSequence, cacheOwner, owners, signals...)
+}
+
+// watchAnswered will run watch with each lookup answered at sequence answered, signals being
+// numbered in order from 1.
+func watchAnswered(answered dbus.Sequence, cacheOwner bool, owners []string, signals ...*dbus.Signal) int {
+	for i, signal := range signals {
+		signal.Sequence = dbus.Sequence(i + 1)
+	}
 	ch := make(chan *dbus.Signal, len(signals))
 	for _, signal := range signals {
 		ch <- signal
 	}
 	close(ch)
 	lookups := 0
-	watchSleepSignals(ch, func() (string, error) {
+	watchSleepSignals(ch, func() (string, dbus.Sequence, error) {
 		lookups++
 		if len(owners) == 0 || owners[0] == "" {
 			if len(owners) > 0 {
 				owners = owners[1:]
 			}
-			return "", errors.New("org.freedesktop.login1 has no owner")
+			return "", answered, errors.New("org.freedesktop.login1 has no owner")
 		}
 		owner := owners[0]
 		owners = owners[1:]
-		return owner, nil
+		return owner, answered, nil
 	}, cacheOwner)
 	return lookups
 }
@@ -545,12 +555,58 @@ func TestListenCachesOwnerOnlyWhenOwnerChangesAreMatched(t *testing.T) {
 				return errors.New("org.freedesktop.DBus.Error.LimitsExceeded")
 			}
 			return nil
-		}, func() (string, error) {
+		}, func() (string, dbus.Sequence, error) {
 			lookups++
-			return ":1.4", nil
+			return ":1.4", dbus.NoSequence, nil
 		})
 		if lookups != want {
 			t.Errorf("AddMatch %d refused: lookups = %d, want %d", refused, lookups, want)
 		}
+	}
+}
+
+func TestWatchReusesLookupForQueuedSignals(t *testing.T) {
+	f := useFakeDevices(t)
+
+	// Without a cached owner, a flood queued before the lookup's reply costs one lookup
+	signals := []*dbus.Signal{}
+	for range 100 {
+		signals = append(signals, sleepSignal(":1.99", false))
+	}
+	signals = append(signals, sleepSignal(":1.4", true))
+	if lookups := watchAnswered(1000, false, []string{":1.4"}, signals...); lookups != 1 {
+		t.Errorf("lookups = %d, want 1", lookups)
+	}
+	if f.devStops != 1 || len(f.exits) != 0 {
+		t.Errorf("devices.Stop = %d, exits = %v; want logind's suspend handled and spoofs ignored", f.devStops, f.exits)
+	}
+}
+
+func TestWatchLooksUpAgainForSignalsAfterReply(t *testing.T) {
+	f := useFakeDevices(t)
+
+	// logind is replaced right after the lookup's reply; its successor's resume, received
+	// after that reply, must not be judged by it
+	lookups := watchAnswered(2, false, []string{":1.4", ":1.50"}, sleepSignal(":1.4", true), sleepSignal(":1.50", false))
+	if lookups != 2 || f.devStops != 1 || !slices.Equal(f.exits, []int{1}) {
+		t.Errorf("lookups = %d, devices.Stop = %d, exits = %v; want the new owner's resume handled after a fresh lookup", lookups, f.devStops, f.exits)
+	}
+}
+
+// replyingBus stands in for the bus daemon, answering every call with reply.
+type replyingBus struct {
+	dbus.BusObject
+	reply *dbus.Call
+}
+
+func (b replyingBus) Call(string, dbus.Flags, ...interface{}) *dbus.Call {
+	return b.reply
+}
+
+func TestLookupLogindReturnsReplySequence(t *testing.T) {
+	// The reply's sequence is what lets queued signals share one lookup
+	owner, answered, err := lookupLogind(replyingBus{reply: &dbus.Call{Body: []interface{}{":1.4"}, ResponseSequence: 7}})
+	if owner != ":1.4" || answered != 7 || err != nil {
+		t.Errorf("lookupLogind = %q, %d, %v; want :1.4, 7, nil", owner, answered, err)
 	}
 }
